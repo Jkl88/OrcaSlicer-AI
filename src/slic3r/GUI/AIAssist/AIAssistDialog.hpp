@@ -1,7 +1,7 @@
 #ifndef slic3r_AIAssist_AIAssistDialog_hpp_
 #define slic3r_AIAssist_AIAssistDialog_hpp_
 
-#include "GUI_Utils.hpp"
+#include "../GUI_Utils.hpp"
 
 #include <wx/dialog.h>
 #include <wx/textctrl.h>
