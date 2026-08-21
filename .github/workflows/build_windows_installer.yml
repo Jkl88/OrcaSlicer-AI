@@ -1,0 +1,103 @@
+# Windows x64 NSIS installer for the OrcaSlicer-AI fork.
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'deps/**'
+      - '**/CMakeLists.txt'
+      - 'version.inc'
+      - 'resources/**'
+      - 'localization/**'
+      - '.github/workflows/build_windows_installer.yml'
+      - '.github/workflows/build_orca.yml'
+      - '.github/workflows/build_deps.yml'
+      - '.github/workflows/build_check_cache.yml'
+      - 'build_release_vs.bat'
+      - 'build_release_vs2022.bat'
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build_windows_x64:
+    name: Build Windows x64
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+    secrets: inherit
+
+  release:
+    name: Publish GitHub Release
+    needs: build_windows_x64
+    if: ${{ success() && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          ver=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: OrcaSlicer_Windows_*
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.ver }}
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          find artifacts -type f -name '*.exe' ! -iname '*portable*' ! -iname '*profile_validator*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*portable*.zip' -exec cp -v {} upload/ \;
+          ls -lah upload || true
+          if [ -z "$(ls -A upload 2>/dev/null)" ]; then
+            echo "::error::No Windows installer artifacts found"
+            exit 1
+          fi
+
+          NOTES=$(cat <<ENDNOTES
+          ## OrcaSlicer-AI ${VER}
+
+          Fork of OrcaSlicer with **AI Assist** (Gemini + Telegram + webcam/Moonraker).
+
+          ### Windows x64
+          Install the \`.exe\` (NSIS). Configure under **Preferences → AI Assist**.
+
+          Docs: https://github.com/${{ github.repository }}/blob/main/docs/AI_ASSIST.md
+          ENDNOTES
+          )
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES" --latest
+          else
+            gh release create "$TAG" upload/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OrcaSlicer-AI ${VER}" \
+              --notes "$NOTES" \
+              --latest
+          fi
