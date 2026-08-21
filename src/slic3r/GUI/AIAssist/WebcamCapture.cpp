@@ -119,7 +119,7 @@ bool WebcamCapture::stop_print(std::string &error) const
             http.header("X-Api-Key", api_key);
         http.header("Content-Type", "application/json")
             .timeout_max(15)
-            .set_post_body("{}")
+            .set_post_body(std::string("{}"))
             .on_complete([&](std::string, unsigned status) {
                 ok = status >= 200 && status < 300;
                 if (!ok)
