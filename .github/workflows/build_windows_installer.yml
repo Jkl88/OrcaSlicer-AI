@@ -54,7 +54,7 @@ jobs:
           echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
 
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: OrcaSlicer_Windows_*
           path: artifacts
