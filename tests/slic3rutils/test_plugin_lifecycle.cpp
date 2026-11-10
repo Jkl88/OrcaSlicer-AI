@@ -4,6 +4,7 @@
 #include <slic3r/plugin/PluginDescriptor.hpp>
 #include <slic3r/plugin/PluginManager.hpp>
 #include <slic3r/plugin/PluginFsUtils.hpp>
+#include <slic3r/plugin/host/PluginHostStorage.hpp>
 #include <slic3r/plugin/PythonInterpreter.hpp>
 
 #include "plugin_test_utils.hpp"
@@ -113,6 +114,71 @@ PluginDescriptor descriptor_of(PluginManager& manager, const std::string& plugin
 }
 
 } // namespace
+
+TEST_CASE("Deleting a plugin retains its private data by default", "[PluginLifecycle][PluginHost][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir data_dir_guard("lifecycle-delete-retains-data");
+    write_plugin(data_dir_guard, "Retained_Data_Plugin", ECHO_PLUGIN_SOURCE);
+
+    PluginManager& manager = PluginManager::instance();
+    manager.discover_plugins(/*async=*/false, /*clear=*/true);
+    const fs::path storage = plugin_storage_path("Retained_Data_Plugin");
+    std::ofstream(storage / "state.txt") << "retained";
+
+    std::string error;
+    CHECK(manager.delete_plugin("Retained_Data_Plugin", error) == PluginDeleteResult::Success);
+    CHECK(error.empty());
+    CHECK(fs::is_regular_file(storage / "state.txt"));
+}
+
+TEST_CASE("Deleting a plugin removes private data only when confirmed", "[PluginLifecycle][PluginHost][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir data_dir_guard("lifecycle-delete-cleans-data");
+    write_plugin(data_dir_guard, "Cleaned_Data_Plugin", ECHO_PLUGIN_SOURCE);
+
+    PluginManager& manager = PluginManager::instance();
+    manager.discover_plugins(/*async=*/false, /*clear=*/true);
+    const fs::path storage = plugin_storage_path("Cleaned_Data_Plugin");
+    std::ofstream(storage / "state.txt") << "remove";
+
+    std::string error;
+    CHECK(manager.delete_plugin("Cleaned_Data_Plugin", error, /*remove_plugin_data=*/true) == PluginDeleteResult::Success);
+    CHECK(error.empty());
+    CHECK_FALSE(fs::exists(storage));
+}
+
+TEST_CASE("Plugin deletion reports data cleanup failure after removing the package", "[PluginLifecycle][PluginHost][Regression][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir data_dir_guard("lifecycle-delete-partial-success");
+    write_plugin(data_dir_guard, "Cleanup_Failure_Plugin", ECHO_PLUGIN_SOURCE);
+
+    PluginManager& manager = PluginManager::instance();
+    manager.discover_plugins(/*async=*/false, /*clear=*/true);
+
+    ScopedTemporaryDir external("orca-plugin-storage-cleanup-external");
+    fs::create_directory_symlink(external.path(), data_dir_guard.dir / "orca_plugins_data");
+
+    std::string error;
+    CHECK(manager.delete_plugin("Cleanup_Failure_Plugin", error, /*remove_plugin_data=*/true) ==
+          PluginDeleteResult::DataCleanupFailed);
+    CHECK_FALSE(error.empty());
+    PluginDescriptor descriptor;
+    CHECK_FALSE(manager.try_get_plugin_descriptor("Cleanup_Failure_Plugin", descriptor));
+    CHECK_FALSE(fs::exists(data_dir_guard.plugins_dir() / "Cleanup_Failure_Plugin"));
+    CHECK(fs::is_directory(external.path()));
+}
 
 TEST_CASE("A discovered script plugin loads and materializes its capability", "[PluginLifecycle][Python]")
 {

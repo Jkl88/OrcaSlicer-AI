@@ -44,7 +44,7 @@ void PluginHostApi::RegisterBindings(pybind11::module_& host)
         const std::string plugin_key = PluginAuditManager::instance().current_plugin();
         if (plugin_key.empty())
             throw std::runtime_error("Plugin storage requires an active plugin context.");
-        return plugin_storage_path(plugin_key).string();
+        return plugin_storage_path(plugin_key).generic_u8string();
     }, "Return the active plugin's private storage directory.");
 }
 

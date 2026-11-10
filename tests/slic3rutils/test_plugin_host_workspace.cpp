@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "python_test_support.hpp"
+#include "plugin_test_utils.hpp"
 
 #include <slic3r/plugin/PluginAuditManager.hpp>
 #include <slic3r/plugin/host/PluginHostStorage.hpp>
@@ -25,6 +26,7 @@ bool has_attr(const py::handle& object, const char* name)
 TEST_CASE("Plugin host storage is private to the active plugin", "[PluginHost][Python]")
 {
     namespace fs = boost::filesystem;
+    Slic3r::ScopedDataDir data_dir_guard("plugin-host-storage-private");
 
     py::object storage = import_orca_module().attr("host").attr("v1").attr("plugin_storage");
     CHECK_THROWS_AS(storage(), py::error_already_set);
@@ -52,6 +54,7 @@ TEST_CASE("Plugin host storage is private to the active plugin", "[PluginHost][P
 TEST_CASE("Plugin host storage rejects escaping identities", "[PluginHost][Python]")
 {
     namespace fs = boost::filesystem;
+    Slic3r::ScopedDataDir data_dir_guard("plugin-host-storage-identities");
 
     py::object storage = import_orca_module().attr("host").attr("v1").attr("plugin_storage");
     for (const std::string& plugin_key : { "../outside", "nested/plugin", "\\\\network", "" }) {
@@ -68,9 +71,10 @@ TEST_CASE("Plugin host storage rejects escaping identities", "[PluginHost][Pytho
     }
 }
 
-TEST_CASE("Plugin data cleanup retains by default and rejects escapes", "[PluginHost]")
+TEST_CASE("Plugin data cleanup retains by default and rejects child escapes", "[PluginHost]")
 {
     namespace fs = boost::filesystem;
+    Slic3r::ScopedDataDir data_dir_guard("plugin-host-storage-cleanup");
 
     const fs::path plugin_one = Slic3r::plugin_storage_path("cleanup-plugin-one");
     const fs::path plugin_two = Slic3r::plugin_storage_path("cleanup-plugin-two");
@@ -96,6 +100,24 @@ TEST_CASE("Plugin data cleanup retains by default and rejects escapes", "[Plugin
 
     CHECK_FALSE(Slic3r::delete_plugin_storage("", error));
     CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("Plugin storage rejects a symlinked data root", "[PluginHost][Regression]")
+{
+    namespace fs = boost::filesystem;
+    Slic3r::ScopedDataDir data_dir_guard("plugin-host-storage-root-symlink");
+    Slic3r::ScopedTemporaryDir external("orca-plugin-storage-external-root");
+
+    const fs::path storage_root = data_dir_guard.dir / "orca_plugins_data";
+    fs::create_directory_symlink(external.path(), storage_root);
+
+    CHECK_THROWS_AS(Slic3r::plugin_storage_path("root-escape"), std::runtime_error);
+    CHECK_FALSE(fs::exists(external.path() / "root-escape"));
+
+    std::string error;
+    CHECK_FALSE(Slic3r::delete_plugin_storage("root-escape", error));
+    CHECK_FALSE(error.empty());
+    CHECK(fs::is_directory(external.path()));
 }
 
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
