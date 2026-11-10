@@ -18,6 +18,7 @@ void PluginHost::RegisterBindings(pybind11::module_& module)
     host_bindings::register_presets(host);
     host_bindings::register_model(host);
     host_bindings::register_app(host);
+    host_bindings::register_preset_workspace(host);
 
     // UI: native dialogs and interactive HTML windows for plugins.
     PluginHostUi::RegisterBindings(host);

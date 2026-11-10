@@ -634,6 +634,9 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHostMesh.hpp
     plugin/host/PluginHostModel.cpp
     plugin/host/PluginHostPresets.cpp
+    plugin/host/PluginPresetSnapshot.cpp
+    plugin/host/PluginPresetSnapshot.hpp
+    plugin/host/PluginHostPresetWorkspace.cpp
     plugin/host/PluginHostSlicing.cpp
     plugin/host/PluginHostUi.cpp
     plugin/host/PluginHostUi.hpp

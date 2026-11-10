@@ -5,10 +5,15 @@
 
 #include <slic3r/plugin/PluginAuditManager.hpp>
 #include <slic3r/plugin/host/PluginHostStorage.hpp>
+#include <slic3r/plugin/host/PluginPresetSnapshot.hpp>
+
+#include <libslic3r/PresetBundle.hpp>
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <pybind11/pybind11.h>
+
+#include <nlohmann/json.hpp>
 
 #include <string>
 
@@ -126,6 +131,67 @@ TEST_CASE("Plugin delete confirmation maps cancellation and data choices", "[Plu
     CHECK(Slic3r::plugin_delete_choice(false, true) == Slic3r::PluginDeleteChoice::Cancel);
     CHECK(Slic3r::plugin_delete_choice(true, false) == Slic3r::PluginDeleteChoice::RetainData);
     CHECK(Slic3r::plugin_delete_choice(true, true) == Slic3r::PluginDeleteChoice::RemoveData);
+}
+
+TEST_CASE("Preset snapshot captures detached selected workspace state", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    Slic3r::Preset& print = bundle.prints.get_edited_preset();
+    Slic3r::Preset& filament = bundle.filaments.get_edited_preset();
+    Slic3r::Preset& printer = bundle.printers.get_edited_preset();
+    print.config.set("layer_height", 0.16, true);
+    printer.config.set("printer_model", "Snapshot Printer", true);
+    bundle.filament_presets = {filament.name, filament.name};
+
+    Slic3r::PresetSnapshotRequest request;
+    request.config_keys[Slic3r::Preset::TYPE_PRINT] = {"layer_height"};
+    const Slic3r::PresetWorkspaceSnapshot snapshot = Slic3r::make_preset_snapshot(bundle, true, true, request);
+    const nlohmann::json json = snapshot;
+
+    CHECK(json.contains("revision"));
+    CHECK(json.contains("resources"));
+    CHECK(json.contains("selected"));
+    CHECK(json.contains("edited"));
+    CHECK(json.contains("filament_slots"));
+    CHECK(json.contains("active_printer"));
+    CHECK(json["project_dirty"] == true);
+    CHECK(json["presets_dirty"] == true);
+    CHECK(json["filament_slots"].size() == 2);
+    CHECK(json["requested_values"]["print"]["layer_height"] == "0.16");
+    CHECK_FALSE(json["requested_values"]["print"].contains("printer_model"));
+
+    const std::string revision = snapshot.revision;
+    bundle.filament_presets[1] = "different filament";
+    CHECK(Slic3r::make_preset_snapshot(bundle, true, true, request).revision != revision);
+
+    print.config.set("layer_height", 0.28, true);
+    CHECK(json["requested_values"]["print"]["layer_height"] == "0.16");
+}
+
+TEST_CASE("Preset snapshot excludes sensitive requested values", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    Slic3r::Preset& print = bundle.prints.get_edited_preset();
+    Slic3r::Preset& printer = bundle.printers.get_edited_preset();
+    print.config.set("layer_height", 0.2, true);
+    printer.config.set("printhost_apikey", "must-not-leak", true);
+    printer.config.set("print_host", "https://printer.example", true);
+    printer.config.set("printhost_user", "must-not-leak", true);
+
+    Slic3r::PresetSnapshotRequest request;
+    request.config_keys[Slic3r::Preset::TYPE_PRINT] = {"layer_height", "does_not_exist"};
+    request.config_keys[Slic3r::Preset::TYPE_PRINTER] = {"printhost_apikey", "print_host", "printhost_user"};
+    const nlohmann::json json = Slic3r::make_preset_snapshot(bundle, false, false, request);
+
+    CHECK(json["requested_values"]["print"]["layer_height"] == "0.2");
+    CHECK_FALSE(json["requested_values"]["print"].contains("does_not_exist"));
+    CHECK_FALSE(json["requested_values"].contains("printer"));
+    REQUIRE(json["diagnostics"].size() == 3);
+    for (const nlohmann::json& diagnostic : json["diagnostics"]) {
+        CHECK(diagnostic["code"] == "sensitive_key");
+        CHECK(diagnostic.contains("key"));
+        CHECK_FALSE(diagnostic.contains("value"));
+    }
 }
 
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
