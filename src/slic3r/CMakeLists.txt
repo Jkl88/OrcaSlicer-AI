@@ -636,6 +636,8 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHostPresets.cpp
     plugin/host/PluginPresetSnapshot.cpp
     plugin/host/PluginPresetSnapshot.hpp
+    plugin/host/PluginPresetTransaction.cpp
+    plugin/host/PluginPresetTransaction.hpp
     plugin/host/PluginHostPresetWorkspace.cpp
     plugin/host/PluginHostSlicing.cpp
     plugin/host/PluginHostUi.cpp

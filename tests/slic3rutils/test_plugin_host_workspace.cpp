@@ -6,6 +6,7 @@
 #include <slic3r/plugin/PluginAuditManager.hpp>
 #include <slic3r/plugin/host/PluginHostStorage.hpp>
 #include <slic3r/plugin/host/PluginPresetSnapshot.hpp>
+#include <slic3r/plugin/host/PluginPresetTransaction.hpp>
 
 #include <libslic3r/PresetBundle.hpp>
 
@@ -192,6 +193,94 @@ TEST_CASE("Preset snapshot excludes sensitive requested values", "[PluginHost]")
         CHECK(diagnostic.contains("key"));
         CHECK_FALSE(diagnostic.contains("value"));
     }
+}
+
+TEST_CASE("Preset transaction rejects malformed operation requests", "[PluginHost]")
+{
+    using Slic3r::PresetTransactionStatus;
+    using nlohmann::json;
+
+    const auto check_invalid = [](const json& request, const char* code) {
+        const Slic3r::PresetTransactionResult result = Slic3r::parse_transaction_request(request);
+        REQUIRE(result.status == PresetTransactionStatus::Invalid);
+        REQUIRE(result.diagnostics.size() == 1);
+        CHECK(result.diagnostics[0]["code"] == code);
+        CHECK(result.diagnostics[0]["operation_index"].is_null());
+    };
+
+    check_invalid({{"expected_revision", "A"}, {"operations", json::array()}}, "empty_operations");
+    check_invalid({{"operations", json::array({{{"op", "select"}}})}}, "missing_expected_revision");
+    const Slic3r::PresetTransactionResult unsupported = Slic3r::parse_transaction_request(
+        {{"expected_revision", "A"}, {"interaction", "silent"}, {"operations", json::array({{{"op", "select"}}})}});
+    REQUIRE(unsupported.status == PresetTransactionStatus::Unsupported);
+    REQUIRE(unsupported.diagnostics.size() == 1);
+    CHECK(unsupported.diagnostics[0]["code"] == "unsupported_interaction");
+    CHECK(unsupported.diagnostics[0]["operation_index"].is_null());
+
+    const auto check_operation_invalid = [](const json& operation, const char* code) {
+        const Slic3r::PresetTransactionResult result = Slic3r::parse_transaction_request(
+            {{"expected_revision", "A"}, {"operations", json::array({operation})}});
+        REQUIRE(result.status == PresetTransactionStatus::Invalid);
+        REQUIRE(result.diagnostics.size() == 1);
+        CHECK(result.diagnostics[0]["code"] == code);
+        CHECK(result.diagnostics[0]["operation_index"] == 0);
+    };
+
+    check_operation_invalid({{"op", "delete"}}, "unknown_operation");
+    check_operation_invalid({{"op", "select"}, {"preset_type", "resin"}, {"name", "A"}, {"scope", {{"slot", 0}}}},
+                            "unknown_preset_type");
+    check_operation_invalid({{"op", "select"}, {"preset_type", "filament"}, {"name", "A"}, {"scope", {{"edited", true}}}},
+                            "invalid_scope");
+    const Slic3r::PresetTransactionResult duplicate = Slic3r::parse_transaction_request(
+        {{"expected_revision", "A"}, {"operations", json::array({
+            {{"op", "set_values"}, {"preset_type", "print"}, {"scope", {{"edited", true}}},
+             {"values", {{"layer_height", "0.16"}}}},
+            {{"op", "set_values"}, {"preset_type", "print"}, {"scope", {{"edited", true}}},
+             {"values", {{"layer_height", "0.20"}}}},
+        })}});
+    REQUIRE(duplicate.status == PresetTransactionStatus::Invalid);
+    REQUIRE(duplicate.diagnostics.size() == 1);
+    CHECK(duplicate.diagnostics[0]["code"] == "duplicate_key_assignment");
+    CHECK(duplicate.diagnostics[0]["operation_index"] == 1);
+}
+
+TEST_CASE("Preset transaction parses select and set-values operations", "[PluginHost]")
+{
+    const Slic3r::PresetTransactionResult result = Slic3r::parse_transaction_request({
+        {"expected_revision", "revision-A"},
+        {"interaction", "confirm"},
+        {"operations", nlohmann::json::array({
+            {{"op", "select"}, {"preset_type", "filament"}, {"name", "Generic PLA"}, {"scope", {{"slot", 0}}}},
+            {{"op", "set_values"}, {"preset_type", "print"}, {"scope", {{"edited", true}}},
+             {"values", {{"layer_height", "0.16"}}}},
+        })},
+    });
+
+    REQUIRE(result.status == Slic3r::PresetTransactionStatus::Valid);
+    REQUIRE(result.request.has_value());
+    CHECK(result.request->expected_revision == "revision-A");
+    CHECK(result.request->interaction == "confirm");
+    REQUIRE(result.request->operations.size() == 2);
+    CHECK(std::holds_alternative<Slic3r::SelectPresetOperation>(result.request->operations[0]));
+    CHECK(std::holds_alternative<Slic3r::SetValuesOperation>(result.request->operations[1]));
+}
+
+TEST_CASE("Preset transaction rejects stale revision before callbacks", "[PluginHost]")
+{
+    int confirmation_calls = 0;
+    int apply_calls = 0;
+    const Slic3r::PresetTransactionResult result = Slic3r::validate_transaction_shape(
+        {{"expected_revision", "A"}, {"operations", nlohmann::json::array({
+            {{"op", "select"}, {"preset_type", "filament"}, {"name", "Generic PLA"}, {"scope", {{"slot", 0}}}},
+        })}},
+        "B",
+        [&] { ++confirmation_calls; return true; },
+        [&] { ++apply_calls; });
+
+    CHECK(result.status == Slic3r::PresetTransactionStatus::Conflict);
+    CHECK(result.affected.empty());
+    CHECK(confirmation_calls == 0);
+    CHECK(apply_calls == 0);
 }
 
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
