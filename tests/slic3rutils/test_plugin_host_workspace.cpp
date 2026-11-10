@@ -120,6 +120,14 @@ TEST_CASE("Plugin storage rejects a symlinked data root", "[PluginHost][Regressi
     CHECK(fs::is_directory(external.path()));
 }
 
+TEST_CASE("Plugin delete confirmation maps cancellation and data choices", "[PluginHost]")
+{
+    CHECK(Slic3r::plugin_delete_choice(false, false) == Slic3r::PluginDeleteChoice::Cancel);
+    CHECK(Slic3r::plugin_delete_choice(false, true) == Slic3r::PluginDeleteChoice::Cancel);
+    CHECK(Slic3r::plugin_delete_choice(true, false) == Slic3r::PluginDeleteChoice::RetainData);
+    CHECK(Slic3r::plugin_delete_choice(true, true) == Slic3r::PluginDeleteChoice::RemoveData);
+}
+
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
 {
     py::object host = import_orca_module().attr("host");

@@ -7,6 +7,7 @@
 #include "slic3r/plugin/PluginConfig.hpp"
 #include "slic3r/plugin/PluginFsUtils.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
+#include "slic3r/plugin/host/PluginHostStorage.hpp"
 
 #include <libslic3r/Utils.hpp>
 
@@ -1131,10 +1132,11 @@ void PluginsDialog::delete_local_plugin(const PluginDescriptor& plugin)
         kDeletePluginTitle, wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
     dialog.SetCheckBox(_L("Remove plugin data"), false);
     const int rc = dialog.ShowModal();
-    const bool remove_plugin_data = rc == wxYES && dialog.IsCheckBoxChecked();
+    const PluginDeleteChoice delete_choice = plugin_delete_choice(rc == wxYES, dialog.IsCheckBoxChecked());
     restore_z_order();
-    if (rc != wxYES)
+    if (delete_choice == PluginDeleteChoice::Cancel)
         return;
+    const bool remove_plugin_data = delete_choice == PluginDeleteChoice::RemoveData;
 
     auto state = std::make_shared<PluginOperationState>();
     run_with_dialog(

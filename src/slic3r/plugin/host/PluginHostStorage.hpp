@@ -6,6 +6,19 @@
 
 namespace Slic3r {
 
+enum class PluginDeleteChoice {
+    Cancel,
+    RetainData,
+    RemoveData,
+};
+
+inline PluginDeleteChoice plugin_delete_choice(bool confirmed, bool remove_data)
+{
+    if (!confirmed)
+        return PluginDeleteChoice::Cancel;
+    return remove_data ? PluginDeleteChoice::RemoveData : PluginDeleteChoice::RetainData;
+}
+
 // Returns the private data directory for plugin_key, creating it when necessary.
 // The caller must establish the plugin audit context before exposing this path to Python.
 boost::filesystem::path plugin_storage_path(const std::string& plugin_key);
