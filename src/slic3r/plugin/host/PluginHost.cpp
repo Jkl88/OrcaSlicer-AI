@@ -1,4 +1,5 @@
 #include "PluginHost.hpp"
+#include "PluginHostApi.hpp"
 #include "PluginHostBindings.hpp"
 #include "PluginHostUi.hpp"
 
@@ -7,6 +8,8 @@ namespace Slic3r {
 void PluginHost::RegisterBindings(pybind11::module_& module)
 {
     auto host = module.def_submodule("host", "Host application API");
+
+    PluginHostApi::RegisterBindings(host);
 
     // Value types first so the docstring signatures of later registrars
     // resolve to the bound Python names.
