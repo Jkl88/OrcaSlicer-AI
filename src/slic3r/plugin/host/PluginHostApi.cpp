@@ -1,8 +1,12 @@
 #include "PluginHostApi.hpp"
+#include "PluginHostStorage.hpp"
 
+#include "slic3r/plugin/PluginAuditManager.hpp"
 #include "slic3r/plugin/PluginFsUtils.hpp"
 
 #include <libslic3r/libslic3r.h>
+
+#include <stdexcept>
 
 namespace Slic3r {
 
@@ -35,7 +39,13 @@ nlohmann::json PluginHostApi::api_info()
 void PluginHostApi::RegisterBindings(pybind11::module_& host)
 {
     host.def("api_info", [] { return json_to_py(api_info()); }, "Return the versioned host API capabilities.");
-    host.def_submodule("v1", "Version 1 host API namespace.");
+    pybind11::module_ v1 = host.def_submodule("v1", "Version 1 host API namespace.");
+    v1.def("plugin_storage", [] {
+        const std::string plugin_key = PluginAuditManager::instance().current_plugin();
+        if (plugin_key.empty())
+            throw std::runtime_error("Plugin storage requires an active plugin context.");
+        return plugin_storage_path(plugin_key).string();
+    }, "Return the active plugin's private storage directory.");
 }
 
 } // namespace Slic3r

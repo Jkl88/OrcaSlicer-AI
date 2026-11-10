@@ -1106,22 +1106,26 @@ void PluginsDialog::open_plugin_hub()
 void PluginsDialog::delete_local_plugin(const PluginDescriptor& plugin)
 {
     const wxString plugin_name = from_u8(plugin.name);
-    const int rc               = wxMessageBox(
-        wxString::Format(plugin.is_cloud_plugin() ?
-                             _L("Delete plugin \"%s\"?\n\nThis removes the local plugin files. The plugin stays in the cloud "
-                                "and can be reinstalled.") :
-                             _L("Delete plugin \"%s\"?\n\nThis permanently removes the plugin folder."),
-                         plugin_name),
-        kDeletePluginTitle, wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+    const wxString delete_message = plugin.is_cloud_plugin() ?
+                                        _L("This removes the local plugin files. The plugin stays in the cloud and can be reinstalled.") :
+                                        _L("This permanently removes the plugin folder.");
+    wxMessageDialog dialog(
+        this,
+        wxString::Format(_L("Delete plugin \"%s\" (identity: %s)?\n\n%s"),
+                         plugin_name, from_u8(plugin.plugin_key), delete_message),
+        kDeletePluginTitle, wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+    dialog.SetCheckBox(_L("Remove plugin data"), false);
+    const int rc = dialog.ShowModal();
+    const bool remove_plugin_data = rc == wxYES && dialog.IsCheckBoxChecked();
     restore_z_order();
     if (rc != wxYES)
         return;
 
     auto state = std::make_shared<PluginOperationState>();
     run_with_dialog(
-        [plugin_key = plugin.plugin_key, cloud_row = as_cloud_only_descriptor(plugin), state]() {
+        [plugin_key = plugin.plugin_key, cloud_row = as_cloud_only_descriptor(plugin), remove_plugin_data, state]() {
             std::string error;
-            const bool succeeded = PluginManager::instance().delete_plugin(plugin_key, error);
+            const bool succeeded = PluginManager::instance().delete_plugin(plugin_key, error, remove_plugin_data);
             // Keep the cloud row listed so the plugin stays reinstallable without waiting on a cloud fetch.
             if (succeeded && cloud_row.is_cloud_plugin())
                 PluginManager::instance().update_cloud_metadata(std::vector<PluginDescriptor>{cloud_row});

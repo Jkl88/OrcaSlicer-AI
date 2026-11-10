@@ -198,7 +198,7 @@ public:
     // If the version is empty, take the latest version.
     bool update_cloud_plugin(const std::string& plugin_key, std::string& error, std::string version = "");
 
-    bool delete_plugin(const std::string& plugin_key, std::string& error);
+    bool delete_plugin(const std::string& plugin_key, std::string& error, bool remove_plugin_data = false);
     bool unsubscribe_cloud_plugin(const std::string& plugin_key, std::string& error);
     bool delete_and_unsubscribe_cloud_plugin(const std::string& plugin_key, std::string& error);
 

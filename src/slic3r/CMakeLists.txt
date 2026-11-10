@@ -625,6 +625,8 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHost.hpp
     plugin/host/PluginHostApi.cpp
     plugin/host/PluginHostApi.hpp
+    plugin/host/PluginHostStorage.cpp
+    plugin/host/PluginHostStorage.hpp
     plugin/host/PluginHostBindings.hpp
     plugin/host/PluginHostApp.cpp
     plugin/host/PluginHostGeometry.cpp
