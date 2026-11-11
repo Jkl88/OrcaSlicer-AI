@@ -382,6 +382,59 @@ TEST_CASE("Preset value staging rolls back on apply failure", "[PluginHost]")
     }
 }
 
+<<<<<<< HEAD
+=======
+TEST_CASE("Filament selection validates slot bounds", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA", "Generic PETG"};
+
+    const Slic3r::FilamentSelectionResult invalid_slot =
+        Slic3r::select_filament_preset_for_test(bundle, 5, "Generic PLA");
+    CHECK(invalid_slot.status == Slic3r::PresetTransactionStatus::InvalidSlot);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+    CHECK(bundle.filament_presets[1] == "Generic PETG");
+}
+
+TEST_CASE("Filament selection validates preset existence and compatibility", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA"};
+
+    const Slic3r::FilamentSelectionResult not_found =
+        Slic3r::select_filament_preset_for_test(bundle, 0, "NonexistentPreset");
+    CHECK(not_found.status == Slic3r::PresetTransactionStatus::NotFound);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+
+    Slic3r::Preset incompatible_preset("IncompatibleFilament", false);
+    incompatible_preset.is_compatible = false;
+    bundle.filaments.presets.push_back(incompatible_preset);
+
+    const Slic3r::FilamentSelectionResult incompatible =
+        Slic3r::select_filament_preset_for_test(bundle, 0, "IncompatibleFilament");
+    CHECK(incompatible.status == Slic3r::PresetTransactionStatus::Incompatible);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+}
+
+TEST_CASE("Filament selection applies valid changes", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA", "Generic PETG"};
+
+    Slic3r::Preset new_preset("Generic ABS", false);
+    new_preset.is_compatible = true;
+    bundle.filaments.presets.push_back(new_preset);
+
+    const Slic3r::FilamentSelectionResult applied =
+        Slic3r::select_filament_preset_for_test(bundle, 1, "Generic ABS");
+    CHECK(applied.status == Slic3r::PresetTransactionStatus::Applied);
+    CHECK(applied.slot == 1);
+    CHECK(applied.preset_name == "Generic ABS");
+    CHECK(bundle.filament_presets[1] == "Generic ABS");
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+}
+
+>>>>>>> worktree-plugin-host-api
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
 {
     py::object host = import_orca_module().attr("host");
@@ -403,3 +456,53 @@ TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][
     CHECK(features[4].cast<std::string>() == "preset_values.v1");
     CHECK(has_attr(host, "v1"));
 }
+<<<<<<< HEAD
+=======
+
+TEST_CASE("Plugin host API v1 surfaces are callable", "[PluginHost][Python]")
+{
+    py::object host = import_orca_module().attr("host");
+
+    CHECK(has_attr(host, "api_info"));
+    CHECK(py::callable(host.attr("api_info")));
+
+    py::object v1 = host.attr("v1");
+    CHECK(has_attr(v1, "plugin_storage"));
+    CHECK(py::callable(v1.attr("plugin_storage")));
+
+    py::object presets = v1.attr("presets");
+    CHECK(has_attr(presets, "snapshot"));
+    CHECK(py::callable(presets.attr("snapshot")));
+    CHECK(has_attr(presets, "commit"));
+    CHECK(py::callable(presets.attr("commit")));
+}
+
+TEST_CASE("Plugin host API returns structured errors without native exceptions", "[PluginHost][Python]")
+{
+    py::object host = import_orca_module().attr("host");
+    py::object commit = host.attr("v1").attr("presets").attr("commit");
+
+    py::dict malformed_request = py::dict();
+    malformed_request["operations"] = py::list();
+
+    py::object result;
+    CHECK_NOTHROW(result = commit(malformed_request));
+
+    py::dict result_dict = result.cast<py::dict>();
+    REQUIRE(result_dict.contains("status"));
+    CHECK(result_dict["status"].cast<std::string>() == "invalid");
+
+    py::dict unsupported_request = py::dict();
+    unsupported_request["expected_revision"] = "test";
+    unsupported_request["interaction"] = "silent";
+    py::list ops = py::list();
+    unsupported_request["operations"] = ops;
+
+    py::object unsupported_result;
+    CHECK_NOTHROW(unsupported_result = commit(unsupported_request));
+
+    py::dict unsupported_dict = unsupported_result.cast<py::dict>();
+    REQUIRE(unsupported_dict.contains("status"));
+    CHECK(unsupported_dict["status"].cast<std::string>() == "unsupported");
+}
+>>>>>>> worktree-plugin-host-api

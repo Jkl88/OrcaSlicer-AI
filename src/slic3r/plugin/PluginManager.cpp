@@ -5,6 +5,7 @@
 #include <pybind11/embed.h>
 
 #include "PluginFsUtils.hpp"
+#include "host/PluginHostStorage.hpp"
 #include "PluginHooks.hpp"
 #include "PythonInterpreter.hpp"
 #include "PythonPluginBridge.hpp"
@@ -1862,26 +1863,31 @@ bool PluginManager::finalize_cloud_plugin_removal(const PluginDescriptor& plugin
     return true;
 }
 
-bool PluginManager::delete_plugin(const std::string& plugin_key, std::string& error)
+PluginDeleteResult PluginManager::delete_plugin(const std::string& plugin_key, std::string& error, bool remove_plugin_data)
 {
     if (!wait_for_discovery(std::chrono::milliseconds::max(), error))
-        return false;
+        return PluginDeleteResult::PackageDeletionFailed;
 
     error.clear();
 
     PluginDescriptor descriptor;
     if (!try_get_plugin_descriptor(plugin_key, descriptor)) {
         error = "Plugin not found: " + plugin_key;
-        return false;
+        return PluginDeleteResult::PackageDeletionFailed;
     }
 
     if (!delete_installed_plugin_package(descriptor, error)) {
         set_plugin_error(plugin_key, error);
-        return false;
+        return PluginDeleteResult::PackageDeletionFailed;
+    }
+
+    if (remove_plugin_data && !delete_plugin_storage(descriptor.plugin_key, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Plugin was removed but its data could not be deleted: " << error;
+        return PluginDeleteResult::DataCleanupFailed;
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": Deleted plugin: " << plugin_key;
-    return true;
+    return PluginDeleteResult::Success;
 }
 
 bool PluginManager::unsubscribe_cloud_plugin(const std::string& plugin_key, std::string& error)

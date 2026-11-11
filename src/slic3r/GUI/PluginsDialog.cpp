@@ -7,6 +7,7 @@
 #include "slic3r/plugin/PluginConfig.hpp"
 #include "slic3r/plugin/PluginFsUtils.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
+#include "slic3r/plugin/host/PluginHostStorage.hpp"
 
 #include <libslic3r/Utils.hpp>
 
@@ -428,9 +429,24 @@ nlohmann::json build_context_actions_payload(const PluginAvailableActions& avail
 struct PluginOperationState
 {
     std::mutex mutex;
+    PluginDeleteResult result = PluginDeleteResult::PackageDeletionFailed;
     bool succeeded = false;
     std::string error;
 };
+
+void store_plugin_delete_result(const std::shared_ptr<PluginOperationState>& state, PluginDeleteResult result, std::string error)
+{
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->result = result;
+    state->error  = std::move(error);
+}
+
+PluginDeleteResult take_plugin_delete_result(const std::shared_ptr<PluginOperationState>& state, std::string& error)
+{
+    std::lock_guard<std::mutex> lock(state->mutex);
+    error = std::move(state->error);
+    return state->result;
+}
 
 void store_plugin_operation_result(const std::shared_ptr<PluginOperationState>& state, bool succeeded, std::string error)
 {
@@ -1106,35 +1122,46 @@ void PluginsDialog::open_plugin_hub()
 void PluginsDialog::delete_local_plugin(const PluginDescriptor& plugin)
 {
     const wxString plugin_name = from_u8(plugin.name);
-    const int rc               = wxMessageBox(
-        wxString::Format(plugin.is_cloud_plugin() ?
-                             _L("Delete plugin \"%s\"?\n\nThis removes the local plugin files. The plugin stays in the cloud "
-                                "and can be reinstalled.") :
-                             _L("Delete plugin \"%s\"?\n\nThis permanently removes the plugin folder."),
-                         plugin_name),
-        kDeletePluginTitle, wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+    const wxString delete_message = plugin.is_cloud_plugin() ?
+                                        _L("This removes the local plugin files. The plugin stays in the cloud and can be reinstalled.") :
+                                        _L("This permanently removes the plugin folder.");
+    wxMessageDialog dialog(
+        this,
+        wxString::Format(_L("Delete plugin \"%s\" (identity: %s)?\n\n%s"),
+                         plugin_name, from_u8(plugin.plugin_key), delete_message),
+        kDeletePluginTitle, wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+    dialog.SetCheckBox(_L("Remove plugin data"), false);
+    const int rc = dialog.ShowModal();
+    const PluginDeleteChoice delete_choice = plugin_delete_choice(rc == wxYES, dialog.IsCheckBoxChecked());
     restore_z_order();
-    if (rc != wxYES)
+    if (delete_choice == PluginDeleteChoice::Cancel)
         return;
+    const bool remove_plugin_data = delete_choice == PluginDeleteChoice::RemoveData;
 
     auto state = std::make_shared<PluginOperationState>();
     run_with_dialog(
-        [plugin_key = plugin.plugin_key, cloud_row = as_cloud_only_descriptor(plugin), state]() {
+        [plugin_key = plugin.plugin_key, cloud_row = as_cloud_only_descriptor(plugin), remove_plugin_data, state]() {
             std::string error;
-            const bool succeeded = PluginManager::instance().delete_plugin(plugin_key, error);
+            const PluginDeleteResult result = PluginManager::instance().delete_plugin(plugin_key, error, remove_plugin_data);
             // Keep the cloud row listed so the plugin stays reinstallable without waiting on a cloud fetch.
-            if (succeeded && cloud_row.is_cloud_plugin())
+            if (result != PluginDeleteResult::PackageDeletionFailed && cloud_row.is_cloud_plugin())
                 PluginManager::instance().update_cloud_metadata(std::vector<PluginDescriptor>{cloud_row});
-            store_plugin_operation_result(state, succeeded, std::move(error));
+            store_plugin_delete_result(state, result, std::move(error));
         },
         [this, state, plugin_name]() {
             std::string error;
-            if (!take_plugin_operation_result(state, error)) {
+            const PluginDeleteResult result = take_plugin_delete_result(state, error);
+            if (result == PluginDeleteResult::PackageDeletionFailed) {
                 show_status(error.empty() ? _L("Failed to delete plugin.") : from_u8(error), "error");
                 return;
             }
 
             send_plugins();
+            if (result == PluginDeleteResult::DataCleanupFailed) {
+                show_status(wxString::Format(_L("Deleted \"%s\", but its data could not be removed: %s"),
+                                             plugin_name, from_u8(error)), "warn");
+                return;
+            }
             show_status(wxString::Format(_L("Deleted \"%s\"."), plugin_name), "success");
         },
         _L("Deleting plugin"), _L("Deleting plugin..."));
@@ -1246,7 +1273,7 @@ void PluginsDialog::reinstall_cloud_plugin(const PluginDescriptor& plugin)
 
     std::string error;
     if (plugin.has_local_package()) {
-        if (!manager.delete_plugin(plugin_key, error)) {
+        if (manager.delete_plugin(plugin_key, error) != PluginDeleteResult::Success) {
             show_status(error.empty() ? _L("Failed to delete plugin.") : from_u8(error), "error");
             send_plugins();
             return;
