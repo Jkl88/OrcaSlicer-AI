@@ -1,5 +1,8 @@
 #include "PluginPresetTransaction.hpp"
 
+#include <libslic3r/PresetBundle.hpp>
+#include <libslic3r/Preset.hpp>
+
 #include <set>
 #include <utility>
 
@@ -130,6 +133,181 @@ PresetTransactionResult validate_transaction_shape(const json& request_json, con
         return result;
     apply();
     return result;
+}
+
+namespace {
+
+bool is_sensitive_key(const std::string& key)
+{
+    static const std::set<std::string> sensitive_keys = {
+        "printhost_apikey", "printhost_password", "printhost_client_cert_password",
+        "print_host", "printhost_user", "printhost_ssl_ca_file",
+    };
+    return sensitive_keys.count(key) > 0 ||
+           key.find("_key") != std::string::npos ||
+           key.find("_password") != std::string::npos ||
+           key.find("_token") != std::string::npos ||
+           key.find("_secret") != std::string::npos ||
+           key.find("apikey") != std::string::npos;
+}
+
+Preset::Type preset_type_from_string(const std::string& type_str)
+{
+    if (type_str == "print")    return Preset::TYPE_PRINT;
+    if (type_str == "filament") return Preset::TYPE_FILAMENT;
+    if (type_str == "printer")  return Preset::TYPE_PRINTER;
+    throw std::invalid_argument("unsupported preset type");
+}
+
+Preset& get_edited_preset(PresetBundle& bundle, const std::string& preset_type)
+{
+    if (preset_type == "print")    return bundle.prints.get_edited_preset();
+    if (preset_type == "filament") return bundle.filaments.get_edited_preset();
+    if (preset_type == "printer")  return bundle.printers.get_edited_preset();
+    throw std::invalid_argument("unsupported preset type");
+}
+
+json diagnostic_json(const char* code, size_t operation_index, const char* field, const char* message)
+{
+    return {{"code", code}, {"operation_index", operation_index}, {"field", field}, {"message", message}};
+}
+
+} // anonymous namespace
+
+StagedPresetChanges stage_value_changes(PresetBundle& bundle, const std::vector<SetValuesOperation>& operations)
+{
+    StagedPresetChanges result;
+    result.diagnostics = json::array();
+
+    std::map<std::string, DynamicPrintConfig> config_copies;
+    size_t operation_index = 0;
+
+    for (const SetValuesOperation& op : operations) {
+        if (op.preset_type != "print" && op.preset_type != "filament" && op.preset_type != "printer") {
+            result.status = PresetTransactionStatus::Invalid;
+            result.diagnostics.push_back(
+                diagnostic_json("unsupported_preset_type", operation_index, "preset_type",
+                               "Preset type must be print, filament, or printer"));
+            return result;
+        }
+
+        try {
+            Preset& edited = get_edited_preset(bundle, op.preset_type);
+
+            if (config_copies.find(op.preset_type) == config_copies.end()) {
+                config_copies[op.preset_type] = edited.config;
+                result.original_configs[op.preset_type] = edited.config;
+            }
+
+            DynamicPrintConfig& config_copy = config_copies[op.preset_type];
+
+            for (auto it = op.values.begin(); it != op.values.end(); ++it) {
+                const std::string& key = it.key();
+                const std::string& serialized_value = it.value().get<std::string>();
+
+                if (is_sensitive_key(key)) {
+                    result.status = PresetTransactionStatus::Invalid;
+                    result.diagnostics.push_back(
+                        diagnostic_json("sensitive_key", operation_index, "values",
+                                       ("Key '" + key + "' contains sensitive data and cannot be modified").c_str()));
+                    return result;
+                }
+
+                const ConfigDef* def = config_copy.def();
+                if (!def || !def->has(key)) {
+                    result.status = PresetTransactionStatus::Invalid;
+                    result.diagnostics.push_back(
+                        diagnostic_json("unknown_key", operation_index, "values",
+                                       ("Unknown configuration key: " + key).c_str()));
+                    return result;
+                }
+
+                const std::string old_value = edited.config.opt_serialize(key);
+
+                ConfigSubstitutionContext substitution_context(ForwardCompatibilitySubstitutionRule::Disable);
+                try {
+                    if (!config_copy.set_deserialize_nothrow(key, serialized_value, substitution_context, false)) {
+                        result.status = PresetTransactionStatus::Invalid;
+                        result.diagnostics.push_back(
+                            diagnostic_json("invalid_value", operation_index, "values",
+                                           ("Cannot deserialize value for key '" + key + "'").c_str()));
+                        return result;
+                    }
+                } catch (const std::exception& e) {
+                    result.status = PresetTransactionStatus::Invalid;
+                    result.diagnostics.push_back(
+                        diagnostic_json("invalid_value", operation_index, "values",
+                                       ("Cannot deserialize value for key '" + key + "': " + e.what()).c_str()));
+                    return result;
+                }
+
+                const std::string new_value = config_copy.opt_serialize(key);
+
+                StagedValueChange change;
+                change.preset_type = op.preset_type;
+                change.key = key;
+                change.old_value = old_value;
+                change.new_value = new_value;
+                result.changes.push_back(change);
+            }
+        } catch (const std::exception& e) {
+            result.status = PresetTransactionStatus::Invalid;
+            result.diagnostics.push_back(
+                diagnostic_json("error", operation_index, "preset_type", e.what()));
+            return result;
+        }
+
+        ++operation_index;
+    }
+
+    result.status = PresetTransactionStatus::Valid;
+    return result;
+}
+
+void apply_staged_value_changes(PresetBundle& bundle, StagedPresetChanges& staged,
+                                const std::function<void(const std::string&)>& on_category_applied)
+{
+    if (staged.status != PresetTransactionStatus::Valid) {
+        throw std::logic_error("Cannot apply staged changes with non-Valid status");
+    }
+
+    std::set<std::string> affected_types;
+    for (const StagedValueChange& change : staged.changes) {
+        affected_types.insert(change.preset_type);
+    }
+
+    try {
+        for (const std::string& type : affected_types) {
+            Preset& edited = get_edited_preset(bundle, type);
+
+            for (const StagedValueChange& change : staged.changes) {
+                if (change.preset_type == type) {
+                    ConfigSubstitutionContext substitution_context(ForwardCompatibilitySubstitutionRule::Disable);
+                    if (!edited.config.set_deserialize_nothrow(change.key, change.new_value, substitution_context, false)) {
+                        throw std::runtime_error("Failed to apply value for key: " + change.key);
+                    }
+                }
+            }
+
+            if (on_category_applied) {
+                on_category_applied(type);
+            }
+        }
+    } catch (...) {
+        rollback_staged_value_changes(bundle, staged);
+        throw;
+    }
+}
+
+void rollback_staged_value_changes(PresetBundle& bundle, const StagedPresetChanges& staged)
+{
+    for (const auto& [preset_type, original_config] : staged.original_configs) {
+        try {
+            Preset& edited = get_edited_preset(bundle, preset_type);
+            edited.config = original_config;
+        } catch (const std::exception&) {
+        }
+    }
 }
 
 } // namespace Slic3r
