@@ -453,3 +453,50 @@ TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][
     CHECK(features[4].cast<std::string>() == "preset_values.v1");
     CHECK(has_attr(host, "v1"));
 }
+
+TEST_CASE("Plugin host API v1 surfaces are callable", "[PluginHost][Python]")
+{
+    py::object host = import_orca_module().attr("host");
+
+    CHECK(has_attr(host, "api_info"));
+    CHECK(py::callable(host.attr("api_info")));
+
+    py::object v1 = host.attr("v1");
+    CHECK(has_attr(v1, "plugin_storage"));
+    CHECK(py::callable(v1.attr("plugin_storage")));
+
+    py::object presets = v1.attr("presets");
+    CHECK(has_attr(presets, "snapshot"));
+    CHECK(py::callable(presets.attr("snapshot")));
+    CHECK(has_attr(presets, "commit"));
+    CHECK(py::callable(presets.attr("commit")));
+}
+
+TEST_CASE("Plugin host API returns structured errors without native exceptions", "[PluginHost][Python]")
+{
+    py::object host = import_orca_module().attr("host");
+    py::object commit = host.attr("v1").attr("presets").attr("commit");
+
+    py::dict malformed_request = py::dict();
+    malformed_request["operations"] = py::list();
+
+    py::object result;
+    CHECK_NOTHROW(result = commit(malformed_request));
+
+    py::dict result_dict = result.cast<py::dict>();
+    REQUIRE(result_dict.contains("status"));
+    CHECK(result_dict["status"].cast<std::string>() == "invalid");
+
+    py::dict unsupported_request = py::dict();
+    unsupported_request["expected_revision"] = "test";
+    unsupported_request["interaction"] = "silent";
+    py::list ops = py::list();
+    unsupported_request["operations"] = ops;
+
+    py::object unsupported_result;
+    CHECK_NOTHROW(unsupported_result = commit(unsupported_request));
+
+    py::dict unsupported_dict = unsupported_result.cast<py::dict>();
+    REQUIRE(unsupported_dict.contains("status"));
+    CHECK(unsupported_dict["status"].cast<std::string>() == "unsupported");
+}
