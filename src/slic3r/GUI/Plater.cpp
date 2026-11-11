@@ -81,6 +81,7 @@
 #include "slic3r/Utils/CrealityPrint.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ObjColorUtils.hpp"
+#include "slic3r/plugin/host/PluginPresetTransaction.hpp"
 // For stl export
 #include "libslic3r/CSGMesh/ModelToCSGMesh.hpp"
 #include "libslic3r/CSGMesh/PerformCSGMeshBooleans.hpp"
@@ -17605,6 +17606,49 @@ void Plater::on_filament_change(size_t filament_idx)
     if (filament == nullptr)
         return;
     std::string filament_type = filament->config.option<ConfigOptionStrings>("filament_type")->values[0];
+}
+
+FilamentSelectionResult Plater::select_filament_preset_for_plugin(size_t slot, const std::string& preset_name)
+{
+    FilamentSelectionResult result;
+    result.slot = slot;
+    result.preset_name = preset_name;
+
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    if (!bundle) {
+        result.status = PresetTransactionStatus::Error;
+        result.message = "Preset bundle not available";
+        return result;
+    }
+
+    if (slot >= bundle->filament_presets.size()) {
+        result.status = PresetTransactionStatus::InvalidSlot;
+        result.message = "Filament slot index out of range";
+        return result;
+    }
+
+    const Preset* preset = bundle->filaments.find_preset(preset_name, false);
+    if (!preset) {
+        result.status = PresetTransactionStatus::NotFound;
+        result.message = "Filament preset not found: " + preset_name;
+        return result;
+    }
+
+    if (!preset->is_compatible) {
+        result.status = PresetTransactionStatus::Incompatible;
+        result.message = "Filament preset is not compatible with current printer";
+        return result;
+    }
+
+    bundle->set_filament_preset(slot, preset_name);
+    update_project_dirty_from_presets();
+    bundle->export_selections(*wxGetApp().app_config);
+    p->sidebar->update_dynamic_filament_list();
+    on_filament_change(slot);
+
+    result.status = PresetTransactionStatus::Applied;
+    result.message = "Filament preset applied successfully";
+    return result;
 }
 
 // BBS.

@@ -382,6 +382,56 @@ TEST_CASE("Preset value staging rolls back on apply failure", "[PluginHost]")
     }
 }
 
+TEST_CASE("Filament selection validates slot bounds", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA", "Generic PETG"};
+
+    const Slic3r::FilamentSelectionResult invalid_slot =
+        Slic3r::select_filament_preset_for_test(bundle, 5, "Generic PLA");
+    CHECK(invalid_slot.status == Slic3r::PresetTransactionStatus::InvalidSlot);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+    CHECK(bundle.filament_presets[1] == "Generic PETG");
+}
+
+TEST_CASE("Filament selection validates preset existence and compatibility", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA"};
+
+    const Slic3r::FilamentSelectionResult not_found =
+        Slic3r::select_filament_preset_for_test(bundle, 0, "NonexistentPreset");
+    CHECK(not_found.status == Slic3r::PresetTransactionStatus::NotFound);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+
+    Slic3r::Preset incompatible_preset("IncompatibleFilament", false);
+    incompatible_preset.is_compatible = false;
+    bundle.filaments.presets.push_back(incompatible_preset);
+
+    const Slic3r::FilamentSelectionResult incompatible =
+        Slic3r::select_filament_preset_for_test(bundle, 0, "IncompatibleFilament");
+    CHECK(incompatible.status == Slic3r::PresetTransactionStatus::Incompatible);
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+}
+
+TEST_CASE("Filament selection applies valid changes", "[PluginHost]")
+{
+    Slic3r::PresetBundle bundle;
+    bundle.filament_presets = {"Generic PLA", "Generic PETG"};
+
+    Slic3r::Preset new_preset("Generic ABS", false);
+    new_preset.is_compatible = true;
+    bundle.filaments.presets.push_back(new_preset);
+
+    const Slic3r::FilamentSelectionResult applied =
+        Slic3r::select_filament_preset_for_test(bundle, 1, "Generic ABS");
+    CHECK(applied.status == Slic3r::PresetTransactionStatus::Applied);
+    CHECK(applied.slot == 1);
+    CHECK(applied.preset_name == "Generic ABS");
+    CHECK(bundle.filament_presets[1] == "Generic ABS");
+    CHECK(bundle.filament_presets[0] == "Generic PLA");
+}
+
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
 {
     py::object host = import_orca_module().attr("host");

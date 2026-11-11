@@ -310,4 +310,35 @@ void rollback_staged_value_changes(PresetBundle& bundle, const StagedPresetChang
     }
 }
 
+FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, size_t slot, const std::string& preset_name)
+{
+    FilamentSelectionResult result;
+    result.slot = slot;
+    result.preset_name = preset_name;
+
+    if (slot >= bundle.filament_presets.size()) {
+        result.status = PresetTransactionStatus::InvalidSlot;
+        result.message = "Filament slot index out of range";
+        return result;
+    }
+
+    const Preset* preset = bundle.filaments.find_preset(preset_name, false);
+    if (!preset) {
+        result.status = PresetTransactionStatus::NotFound;
+        result.message = "Filament preset not found: " + preset_name;
+        return result;
+    }
+
+    if (!preset->is_compatible) {
+        result.status = PresetTransactionStatus::Incompatible;
+        result.message = "Filament preset is not compatible with current printer";
+        return result;
+    }
+
+    bundle.filament_presets[slot] = preset_name;
+    result.status = PresetTransactionStatus::Applied;
+    result.message = "Filament preset applied successfully";
+    return result;
+}
+
 } // namespace Slic3r

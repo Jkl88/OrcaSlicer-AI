@@ -569,6 +569,10 @@ public:
     void on_filament_change(size_t filament_idx);
     void on_filament_count_change(size_t extruders_count);
     void on_filaments_delete(size_t extruders_count, size_t filament_id, int replace_filament_id = -1);
+
+    // Plugin host API: safe filament preset selection
+    Slic3r::FilamentSelectionResult select_filament_preset_for_plugin(size_t slot, const std::string& preset_name);
+
     std::vector<Slic3r::ColorRGBA> get_extruders_colors();
     // BBS
     void on_bed_type_change(BedType bed_type);

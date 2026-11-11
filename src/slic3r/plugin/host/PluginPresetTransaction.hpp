@@ -41,6 +41,12 @@ enum class PresetTransactionStatus {
     Invalid,
     Unsupported,
     Conflict,
+    Applied,
+    Cancelled,
+    NotFound,
+    Incompatible,
+    InvalidSlot,
+    Error,
 };
 
 struct PresetTransactionResult
@@ -68,6 +74,14 @@ struct StagedPresetChanges
     std::map<std::string, DynamicPrintConfig> original_configs;
 };
 
+struct FilamentSelectionResult
+{
+    PresetTransactionStatus status{PresetTransactionStatus::Invalid};
+    size_t                  slot{0};
+    std::string             preset_name;
+    std::string             message;
+};
+
 PresetTransactionResult parse_transaction_request(const nlohmann::json& request);
 
 PresetTransactionResult validate_transaction_shape(const nlohmann::json& request, const std::string& current_revision,
@@ -80,5 +94,8 @@ void apply_staged_value_changes(PresetBundle& bundle, StagedPresetChanges& stage
                                 const std::function<void(const std::string&)>& on_category_applied = nullptr);
 
 void rollback_staged_value_changes(PresetBundle& bundle, const StagedPresetChanges& staged);
+
+// Test-only filament selection adapter (no GUI dependencies)
+FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, size_t slot, const std::string& preset_name);
 
 } // namespace Slic3r
