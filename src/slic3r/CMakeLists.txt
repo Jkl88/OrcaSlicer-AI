@@ -623,6 +623,10 @@ set(SLIC3R_GUI_SOURCES
     plugin/PluginBindingUtils.hpp
     plugin/host/PluginHost.cpp
     plugin/host/PluginHost.hpp
+    plugin/host/PluginHostApi.cpp
+    plugin/host/PluginHostApi.hpp
+    plugin/host/PluginHostStorage.cpp
+    plugin/host/PluginHostStorage.hpp
     plugin/host/PluginHostBindings.hpp
     plugin/host/PluginHostApp.cpp
     plugin/host/PluginHostGeometry.cpp
@@ -630,6 +634,11 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHostMesh.hpp
     plugin/host/PluginHostModel.cpp
     plugin/host/PluginHostPresets.cpp
+    plugin/host/PluginPresetSnapshot.cpp
+    plugin/host/PluginPresetSnapshot.hpp
+    plugin/host/PluginPresetTransaction.cpp
+    plugin/host/PluginPresetTransaction.hpp
+    plugin/host/PluginHostPresetWorkspace.cpp
     plugin/host/PluginHostSlicing.cpp
     plugin/host/PluginHostUi.cpp
     plugin/host/PluginHostUi.hpp

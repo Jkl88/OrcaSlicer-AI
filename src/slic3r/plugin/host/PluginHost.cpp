@@ -1,4 +1,5 @@
 #include "PluginHost.hpp"
+#include "PluginHostApi.hpp"
 #include "PluginHostBindings.hpp"
 #include "PluginHostUi.hpp"
 
@@ -8,6 +9,8 @@ void PluginHost::RegisterBindings(pybind11::module_& module)
 {
     auto host = module.def_submodule("host", "Host application API");
 
+    PluginHostApi::RegisterBindings(host);
+
     // Value types first so the docstring signatures of later registrars
     // resolve to the bound Python names.
     host_bindings::register_geometry(host);
@@ -15,6 +18,7 @@ void PluginHost::RegisterBindings(pybind11::module_& module)
     host_bindings::register_presets(host);
     host_bindings::register_model(host);
     host_bindings::register_app(host);
+    host_bindings::register_preset_workspace(host);
 
     // UI: native dialogs and interactive HTML windows for plugins.
     PluginHostUi::RegisterBindings(host);
