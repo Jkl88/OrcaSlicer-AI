@@ -341,4 +341,59 @@ FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, si
     return result;
 }
 
+PresetTransactionResult commit_preset_transaction_for_test(
+    PresetBundle& bundle,
+    const std::string& current_revision,
+    const std::string& plugin_id,
+    const json& request_json,
+    const TransactionConfirmCallback& confirm_callback,
+    bool inject_apply_failure)
+{
+    PresetTransactionResult result = parse_transaction_request(request_json);
+    if (result.status != PresetTransactionStatus::Valid)
+        return result;
+
+    if (result.request->expected_revision != current_revision) {
+        result.status = PresetTransactionStatus::Conflict;
+        result.revision = current_revision;
+        result.affected = json::array();
+        return result;
+    }
+
+    std::vector<SetValuesOperation> value_ops;
+    for (const auto& op : result.request->operations) {
+        if (std::holds_alternative<SetValuesOperation>(op)) {
+            value_ops.push_back(std::get<SetValuesOperation>(op));
+        }
+    }
+
+    StagedPresetChanges staged = stage_value_changes(bundle, value_ops);
+    if (staged.status != PresetTransactionStatus::Valid) {
+        result.status = staged.status;
+        result.diagnostics = staged.diagnostics;
+        return result;
+    }
+
+    if (!confirm_callback(plugin_id, staged.changes)) {
+        result.status = PresetTransactionStatus::Cancelled;
+        result.message = "User cancelled the transaction";
+        return result;
+    }
+
+    try {
+        if (inject_apply_failure) {
+            throw std::runtime_error("Injected apply failure for testing");
+        }
+        apply_staged_value_changes(bundle, staged);
+        result.status = PresetTransactionStatus::Applied;
+        result.revision = current_revision;
+    } catch (const std::exception& e) {
+        result.status = PresetTransactionStatus::Error;
+        result.message = std::string("Apply failed: ") + e.what();
+        rollback_staged_value_changes(bundle, staged);
+    }
+
+    return result;
+}
+
 } // namespace Slic3r

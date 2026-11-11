@@ -98,4 +98,14 @@ void rollback_staged_value_changes(PresetBundle& bundle, const StagedPresetChang
 // Test-only filament selection adapter (no GUI dependencies)
 FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, size_t slot, const std::string& preset_name);
 
+// Test-only transaction coordinator (no GUI dependencies, injectable confirmation callback)
+using TransactionConfirmCallback = std::function<bool(const std::string& plugin_id, const std::vector<StagedValueChange>& changes)>;
+PresetTransactionResult commit_preset_transaction_for_test(
+    PresetBundle& bundle,
+    const std::string& current_revision,
+    const std::string& plugin_id,
+    const nlohmann::json& request_json,
+    const TransactionConfirmCallback& confirm_callback,
+    bool inject_apply_failure = false);
+
 } // namespace Slic3r
