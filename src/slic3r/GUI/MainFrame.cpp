@@ -43,7 +43,6 @@
 // BBS
 #include "PartPlate.hpp"
 #include "Preferences.hpp"
-#include "AIAssist/AIAssistDialog.hpp"
 #include "Widgets/ProgressDialog.hpp"
 #include "BindDialog.hpp"
 #include "../Utils/MacDarkMode.hpp"
@@ -2652,9 +2651,6 @@ static wxMenu* generate_help_menu()
     // shortcut key
     append_menu_item(helpMenu, wxID_ANY, _L("Keyboard Shortcuts") + sep + "&?", _L("Show the list of keyboard shortcuts"),
         [](wxCommandEvent&) { wxGetApp().keyboard_shortcuts(); });
-    append_menu_item(helpMenu, wxID_ANY, _L("AI Assist") + dots,
-        _L("Gemini analysis of print settings, problem fixes, webcam monitor"),
-        [](wxCommandEvent&) { Slic3r::GUI::AIAssist::show_ai_assist_dialog(wxGetApp().mainframe); });
     // Show Beginner's Tutorial
     append_menu_item(helpMenu, wxID_ANY, _L("Setup Wizard"), _L("Setup Wizard"), [](wxCommandEvent &) {wxGetApp().ShowUserGuide();});
 

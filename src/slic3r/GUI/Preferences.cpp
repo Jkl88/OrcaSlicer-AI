@@ -20,7 +20,6 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DownloadProgressDialog.hpp"
-#include "AIAssist/AIConfig.hpp"
 
 #ifdef __WINDOWS__
 #ifdef _MSW_DARK_MODE
@@ -648,34 +647,6 @@ wxBoxSizer *PreferencesDialog::create_item_loglevel_combobox(wxString title, wxS
         app_config->set("log_severity_level",level);
         e.Skip();
      });
-    return m_sizer;
-}
-
-wxBoxSizer *PreferencesDialog::create_item_string(wxString title, wxString tooltip, const std::string &section, const std::string &param, const std::string &placeholder)
-{
-    auto tip = tooltip.IsEmpty() ? title : tooltip;
-    wxBoxSizer *m_sizer = create_item_label(title, tip);
-
-    // Шире обычного DESIGN_INPUT — для URL и токенов
-    auto input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition,
-                                 wxSize(FromDIP(280), -1), wxTE_PROCESS_ENTER);
-    StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled),
-                        std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
-    input->SetBackgroundColor(input_bg);
-    std::string cur = app_config->get(section, param);
-    if (cur.empty() && !placeholder.empty())
-        input->GetTextCtrl()->SetHint(from_u8(placeholder));
-    input->GetTextCtrl()->SetValue(from_u8(cur));
-    input->SetToolTip(tip);
-
-    auto save = [this, section, param, input]() {
-        app_config->set(section, param, into_u8(input->GetTextCtrl()->GetValue()));
-        app_config->save();
-    };
-    input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [save](wxCommandEvent &e) { save(); e.Skip(); });
-    input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [save](wxFocusEvent &e) { save(); e.Skip(); });
-
-    m_sizer->Add(input, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
     return m_sizer;
 }
 
@@ -2132,74 +2103,6 @@ void PreferencesDialog::create_items()
     sizer_page->Add(g_sizer, 0, wxEXPAND);
     }
 #endif // _WIN32
-
-    //////////////////////////
-    //// AI ASSIST TAB
-    /////////////////////////////////////
-    {
-        using namespace AIAssist;
-        m_pref_tabs->AppendItem(_L("AI Assist"));
-        f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
-        g_sizer = f_sizers.back();
-        g_sizer->AddGrowableCol(0, 1);
-
-        g_sizer->Add(create_item_title(_L("Gemini")), 1, wxEXPAND);
-        g_sizer->Add(create_item_string(_L("API key"),
-            _L("Google AI Studio / Gemini API key. Stored only in local OrcaSlicer.conf."),
-            SECTION, KEY_GEMINI_API_KEY));
-        g_sizer->Add(create_item_string(_L("Model"),
-            _L("Gemini model id, e.g. gemini-2.0-flash"),
-            SECTION, KEY_GEMINI_MODEL, DEFAULT_GEMINI_MODEL));
-        g_sizer->Add(create_item_string(_L("Gemini API base URL"),
-            _L("Optional custom base (proxy). Default: Google Generative Language API."),
-            SECTION, KEY_GEMINI_BASE_URL, DEFAULT_GEMINI_BASE));
-
-        g_sizer->Add(create_item_title(_L("Telegram")), 1, wxEXPAND);
-        g_sizer->Add(create_item_string(_L("Bot token"),
-            _L("Telegram bot token from @BotFather."),
-            SECTION, KEY_TG_BOT_TOKEN));
-        g_sizer->Add(create_item_string(_L("Chat ID"),
-            _L("Numeric chat id (or channel id) for alerts."),
-            SECTION, KEY_TG_CHAT_ID));
-        g_sizer->Add(create_item_string(_L("Telegram API base URL"),
-            _L("Replace api.telegram.org with your proxy (e.g. proxyTelega / Cloudflare Worker). No trailing slash."),
-            SECTION, KEY_TG_API_BASE, DEFAULT_TG_API_BASE));
-
-        g_sizer->Add(create_item_title(_L("Webcam / Moonraker")), 1, wxEXPAND);
-        g_sizer->Add(create_item_string(_L("Webcam source (moonraker|direct)"),
-            _L("moonraker: use Moonraker host + /webcam/?action=snapshot (or Webcam URL if set). direct: only Webcam URL."),
-            SECTION, KEY_WEBCAM_SOURCE, DEFAULT_WEBCAM_SOURCE));
-        g_sizer->Add(create_item_string(_L("Webcam snapshot URL"),
-            _L("Full URL to a still JPEG/PNG, e.g. http://printer.local/webcam/?action=snapshot"),
-            SECTION, KEY_WEBCAM_URL));
-        g_sizer->Add(create_item_string(_L("Moonraker URL"),
-            _L("Printer Moonraker host, e.g. http://192.168.1.50:7125 — snapshot fallback and Stop print."),
-            SECTION, KEY_MOONRAKER_URL));
-        g_sizer->Add(create_item_string(_L("Moonraker API key"),
-            _L("Optional X-Api-Key for Moonraker."),
-            SECTION, KEY_MOONRAKER_API_KEY));
-        g_sizer->Add(create_item_string(_L("Monitor interval (sec)"),
-            _L("How often to analyze webcam frames while monitor is running (15–600)."),
-            SECTION, KEY_MONITOR_INTERVAL_S, DEFAULT_MONITOR_INTERVAL));
-
-        // Чекбокс секции ai_assist: create_item_checkbox пишет в app — делаем вручную
-        {
-            wxBoxSizer *row = create_item_label(_L("Enable webcam monitor on startup"),
-                _L("After launch, start background vision checks (Gemini + Telegram + camera)."));
-            auto *cb = new ::CheckBox(m_parent);
-            cb->SetValue(get_bool(app_config, KEY_MONITOR_ENABLED, false));
-            cb->Bind(wxEVT_TOGGLEBUTTON, [this, cb](wxCommandEvent &e) {
-                e.Skip();
-                AIAssist::set_bool(app_config, AIAssist::KEY_MONITOR_ENABLED, cb->GetValue());
-                app_config->save();
-            });
-            row->Add(cb, 0, wxALIGN_CENTER);
-            g_sizer->Add(row);
-        }
-
-        g_sizer->AddSpacer(FromDIP(10));
-        sizer_page->Add(g_sizer, 0, wxEXPAND);
-    }
 
     //////////////////////////
     //// DEVELOPER TAB

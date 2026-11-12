@@ -20,19 +20,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/3DScene.hpp
     GUI/Widgets/FilamentLoad.cpp
     GUI/Widgets/FilamentLoad.hpp
-    GUI/AIAssist/AIAssistDialog.cpp
-    GUI/AIAssist/AIAssistDialog.hpp
-    GUI/AIAssist/AIConfig.hpp
-    GUI/AIAssist/GeminiClient.cpp
-    GUI/AIAssist/GeminiClient.hpp
-    GUI/AIAssist/PresetAnalyzer.cpp
-    GUI/AIAssist/PresetAnalyzer.hpp
-    GUI/AIAssist/PrintMonitor.cpp
-    GUI/AIAssist/PrintMonitor.hpp
-    GUI/AIAssist/TelegramClient.cpp
-    GUI/AIAssist/TelegramClient.hpp
-    GUI/AIAssist/WebcamCapture.cpp
-    GUI/AIAssist/WebcamCapture.hpp
     GUI/AboutDialog.cpp
     GUI/AboutDialog.hpp
     GUI/AmsMappingPopup.cpp

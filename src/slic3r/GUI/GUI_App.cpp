@@ -103,7 +103,6 @@
 #include "../Utils/UndoRedo.hpp"
 #include "slic3r/Config/Snapshot.hpp"
 #include "Preferences.hpp"
-#include "AIAssist/PrintMonitor.hpp"
 #include "Tab.hpp"
 #include "SysInfoDialog.hpp"
 #include "UpdateDialogs.hpp"
@@ -1081,14 +1080,6 @@ void GUI_App::post_init()
         }
     }
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
-
-    // AI Assist: фоновый монитор камеры (если включён в настройках)
-    try {
-        Slic3r::GUI::AIAssist::PrintMonitor::instance().start(app_config);
-    } catch (const std::exception &ex) {
-        BOOST_LOG_TRIVIAL(error) << "AIAssist PrintMonitor start failed: " << ex.what();
-    }
-
 //BBS: remove the single instance currently
 #ifdef _WIN32
     // Sets window property to mainframe so other instances can indentify it.
@@ -2349,10 +2340,6 @@ void GUI_App::init_networking_callbacks()
 GUI_App::~GUI_App()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": enter");
-
-    try {
-        Slic3r::GUI::AIAssist::PrintMonitor::instance().stop();
-    } catch (...) {}
 
     if (m_agent)
         m_agent->set_printer_agent(nullptr);

@@ -1,4 +1,4 @@
-> **This tree includes AI Assist** (Gemini settings analysis, defect-based fixes, webcam monitor + Telegram alerts with custom Bot API host). See [docs/AI_ASSIST.md](docs/AI_ASSIST.md).
+> **OrcaSlicer-AI**: OrcaSlicer with a versioned plugin host API (`orca.host.v1`) and two plugins — AI Assist (Gemini preset assistant) and Filament QR (spool QR labels and phone scanning). Install guide (RU): [docs/PLUGINS_RU.md](docs/PLUGINS_RU.md).
 
 <div align="center">
 
