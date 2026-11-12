@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from .test_gemini import FakeGemini, gemini_body
+from .test_providers import FakeGemini, gemini_body, openai_body
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "orca_ai_assist.py"
 API_KEY = "AIzaPLUGINKEY-987"
@@ -218,18 +218,91 @@ class AutomaticModeTests(AppTestCase):
         self.configure()
         with open(os.path.join(self._tmp.name, "config.json"), encoding="utf-8") as f:
             saved = json.load(f)
-        self.assertEqual(saved, {"gemini_api_key": API_KEY, "gemini_model": "gemini-2.5-flash",
-                                 "base_url": self.fake.base_url, "preset_data_consent": True})
+        self.assertEqual(saved["provider"], "gemini")
+        self.assertEqual(saved["settings"]["gemini"], {"api_key": API_KEY, "model": "gemini-2.5-flash",
+                                                       "base_url": self.fake.base_url, "consent": True})
         state = self.page.last("state")
         self.assertTrue(state["key_set"])
         self.assertTrue(state["consent"])
         self.analyze()
         self.assertNotIn(API_KEY, json.dumps(self.page.messages))
 
-    def test_invalid_settings_rejected(self):
-        self.app.handle({"type": "save_settings", "api_key": API_KEY, "base_url": "http://evil.example"})
-        self.assertEqual(self.status()["level"], "error")
-        self.assertFalse(os.path.exists(os.path.join(self._tmp.name, "config.json")))
+    def saved(self):
+        with open(os.path.join(self._tmp.name, "config.json"), encoding="utf-8") as f:
+            return json.load(f)["settings"]
+
+    def test_invalid_field_does_not_block_the_others(self):
+        self.app.handle({"type": "save_settings", "api_key": API_KEY, "model": "gemini-2.5-pro",
+                         "base_url": "http://evil.example"})
+        status = self.status()
+        self.assertEqual(status["level"], "error")
+        self.assertIn("Адрес API", status["text"])
+        saved = self.saved()["gemini"]
+        self.assertEqual((saved["api_key"], saved["model"]), (API_KEY, "gemini-2.5-pro"))
+        self.assertEqual(saved["base_url"], "https://generativelanguage.googleapis.com")
+
+    def test_unchecked_key_is_saved(self):
+        self.app.handle({"type": "save_settings", "api_key": "not-a-working-key", "model": "my-model",
+                         "base_url": self.fake.base_url})
+        self.assertEqual(self.status()["level"], "ok")
+        self.assertEqual(self.saved()["gemini"]["api_key"], "not-a-working-key")
+        self.assertEqual(self.page.last("state")["model"], "my-model")
+        self.assertEqual(self.fake.requests, [])
+
+    def test_saved_model_survives_analyze(self):
+        self.configure()
+        self.app.handle({"type": "save_settings", "model": "gemini-2.5-pro"})
+        self.analyze()
+        self.assertEqual(self.page.last("state")["model"], "gemini-2.5-pro")
+        self.assertEqual(self.fake.requests[-1]["path"], "/v1beta/models/gemini-2.5-pro:generateContent")
+
+    def test_load_models_fills_the_list(self):
+        self.configure()
+        self.fake.reply = lambda h: (200, {"models": [
+            {"name": "models/gemini-x", "supportedGenerationMethods": ["generateContent"]}]}, {})
+        self.page.clear()
+        self.app.handle({"type": "load_models"})
+        models = self.page.wait_for(lambda m: m.get("type") == "models")
+        self.assertEqual(models["models"], ["gemini-x"])
+        self.assertEqual(self.fake.requests[-1]["method"], "GET")
+        self.page.wait_for(lambda m: m.get("type") == "state" and m["models"] == ["gemini-x"])
+
+    def test_failed_model_list_keeps_saved_key(self):
+        self.configure()
+        self.fake.reply = lambda h: (401, {"error": {"message": "bad key"}}, {})
+        self.page.clear()
+        self.app.handle({"type": "load_models"})
+        status = self.page.wait_for(lambda m: m.get("type") == "status" and m["level"] == "error")
+        self.assertIn("401", status["text"])
+        self.assertEqual(self.saved()["gemini"]["api_key"], API_KEY)
+
+    def test_providers_keep_separate_settings_and_consent(self):
+        self.configure()
+        self.app.handle({"type": "save_settings", "provider": "openai", "api_key": "sk-OTHER",
+                         "model": "openai/gpt-4o", "base_url": self.fake.base_url})
+        state = self.page.last("state")
+        self.assertEqual((state["provider"], state["model"], state["consent"]), ("openai", "openai/gpt-4o", False))
+        self.assertEqual([p["id"] for p in state["providers"]], ["gemini", "openai", "anthropic"])
+        self.app.handle({"type": "analyze"})
+        self.assertIn("согласие", self.status()["text"])
+        self.app.handle({"type": "consent", "value": True})
+        self.fake.reply = lambda h: (200, openai_body(json.dumps({"summary": "ok", "recommendations": []})), {})
+        self.page.clear()
+        self.app.handle({"type": "analyze"})
+        self.page.wait_for(lambda m: m.get("type") == "status" and "не предложила" in m["text"])
+        request = self.fake.requests[-1]
+        self.assertEqual(request["path"], "/chat/completions")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer sk-OTHER")
+        self.app.handle({"type": "save_settings", "provider": "gemini"})
+        state = self.page.last("state")
+        self.assertEqual((state["provider"], state["key_set"], state["consent"]), ("gemini", True, True))
+        self.assertNotIn("sk-OTHER", json.dumps(self.page.messages))
+
+    def test_unknown_provider_is_rejected(self):
+        self.app.handle({"type": "save_settings", "provider": "acme"})
+        self.assertIn("ИИ-сервис", self.status()["text"])
+        self.app.handle({"type": "init"})
+        self.assertEqual(self.page.last("state")["provider"], "gemini")
 
     def test_clear_key(self):
         self.configure()
@@ -610,8 +683,9 @@ class OrcaLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.orca.plugins), 1)
         self.orca.plugins[0]().register_capabilities()
         self.assertEqual(self.orca.capabilities, [self.module.AiAssistPage])
-        self.assertEqual(self.orca.permission_requests,
-                         [{"network": ["https://generativelanguage.googleapis.com"], "threading": True}])
+        self.assertEqual(self.orca.permission_requests, [{"network": [
+            "https://generativelanguage.googleapis.com", "https://api.openai.com", "https://api.anthropic.com"],
+            "threading": True}])
         page = self.module.AiAssistPage()
         self.assertEqual(page.get_name(), "AI Assist")
         self.assertIn("<html", page.get_ui())

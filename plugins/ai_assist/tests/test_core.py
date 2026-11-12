@@ -91,15 +91,25 @@ class ConfigTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def write(self, data):
+        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
     def test_missing_file_gives_defaults(self):
         config, warning = ai.load_config(self.dir)
         self.assertEqual(config, ai.AiConfig())
-        self.assertEqual(config.gemini_model, "gemini-2.5-flash")
-        self.assertEqual(config.base_url, "https://generativelanguage.googleapis.com")
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.active.model, "gemini-2.5-flash")
+        self.assertEqual(config.active.base_url, "https://generativelanguage.googleapis.com")
+        self.assertEqual(config.settings["openai"].base_url, "https://api.openai.com/v1")
+        self.assertEqual(config.settings["anthropic"].base_url, "https://api.anthropic.com")
         self.assertIsNone(warning)
 
     def test_round_trip_is_atomic_and_private(self):
-        config = ai.AiConfig("AIzaSECRET", "gemini-2.5-pro", "https://proxy.example/api", True)
+        config = ai.AiConfig()
+        config.provider = "openai"
+        config.settings["openai"] = ai.ProviderSettings("sk-SECRET", "openai/gpt-4o", "https://openrouter.ai/api/v1",
+                                                        True)
         ai.save_config(self.dir, config)
         self.assertEqual(os.listdir(self.dir), ["config.json"])
         self.assertEqual(ai.load_config(self.dir), (config, None))
@@ -107,35 +117,59 @@ class ConfigTests(unittest.TestCase):
             mode = stat.S_IMODE(os.stat(os.path.join(self.dir, "config.json")).st_mode)
             self.assertEqual(mode, 0o600)
 
+    def test_legacy_gemini_config_is_migrated(self):
+        self.write({"gemini_api_key": "AIzaOLD", "gemini_model": "gemini-2.5-pro",
+                    "base_url": "https://proxy.example/api", "preset_data_consent": True})
+        config = ai.load_config(self.dir)[0]
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.active, ai.ProviderSettings("AIzaOLD", "gemini-2.5-pro", "https://proxy.example/api",
+                                                            True))
+
     def test_failed_replace_keeps_old_file_and_no_temp(self):
-        ai.save_config(self.dir, ai.AiConfig("old-key"))
+        old = ai.AiConfig()
+        old.active.api_key = "old-key"
+        ai.save_config(self.dir, old)
+        new = ai.AiConfig()
+        new.active.api_key = "new-key"
         with mock.patch.object(ai.os, "replace", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
-                ai.save_config(self.dir, ai.AiConfig("new-key"))
+                ai.save_config(self.dir, new)
         self.assertEqual(os.listdir(self.dir), ["config.json"])
-        self.assertEqual(ai.load_config(self.dir)[0].gemini_api_key, "old-key")
+        self.assertEqual(ai.load_config(self.dir)[0].active.api_key, "old-key")
 
     def test_malformed_file_gives_defaults_without_echoing_secret(self):
-        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
-            f.write('{"gemini_api_key": "AIzaLEAKED123", broken')
+        self.write('{"gemini_api_key": "AIzaLEAKED123", broken')
         config, warning = ai.load_config(self.dir)
         self.assertEqual(config, ai.AiConfig())
         self.assertIn("повреждён", warning)
         self.assertNotIn("AIzaLEAKED123", warning)
 
     def test_non_object_file_gives_defaults(self):
-        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
-            f.write("[1, 2]")
+        self.write("[1, 2]")
         config, warning = ai.load_config(self.dir)
         self.assertEqual(config, ai.AiConfig())
         self.assertIsNotNone(warning)
 
     def test_invalid_fields_fall_back_individually(self):
-        data = {"gemini_api_key": "bad key\n", "gemini_model": "../../evil", "base_url": "http://evil.example",
-                "preset_data_consent": "yes"}
-        with open(os.path.join(self.dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        self.assertEqual(ai.load_config(self.dir)[0], ai.AiConfig())
+        self.write({"provider": "acme", "settings": {
+            "gemini": {"api_key": "bad key\n", "model": "../../evil", "base_url": "http://evil.example",
+                       "consent": "yes"},
+            "openai": {"api_key": "sk-ok", "model": "gpt-4o", "base_url": "ftp://x", "consent": True},
+            "acme": {"api_key": "x"}}})
+        config = ai.load_config(self.dir)[0]
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.settings["gemini"], ai.AiConfig().settings["gemini"])
+        self.assertEqual(config.settings["openai"],
+                         ai.ProviderSettings("sk-ok", "gpt-4o", "https://api.openai.com/v1", True))
+        self.assertNotIn("acme", config.settings)
+
+    def test_model_names_of_all_providers_are_accepted(self):
+        for name in ("gemini-2.5-flash", "openai/gpt-4o-mini", "llama3.1:8b", "claude-3-5-haiku@20241022",
+                     "meta-llama/Llama-3.3-70B-Instruct"):
+            self.assertEqual(ai.validate_model(name), name)
+        for bad in ("", " ", "bad model", "../x", "-x", "x" * 129, "a\nb"):
+            with self.subTest(model=bad), self.assertRaises(ValueError):
+                ai.validate_model(bad)
 
     def test_base_url_validation(self):
         self.assertEqual(ai.validate_base_url("https://x.example/"), "https://x.example")
@@ -448,6 +482,14 @@ class ManualInstructionsTests(unittest.TestCase):
 
 
 class PageTests(unittest.TestCase):
+    def test_settings_are_not_overwritten_while_edited_and_model_saves_on_change(self):
+        page = ai.PAGE_HTML
+        self.assertIn("if (document.activeElement !== $('model')) $('model').value = s.model;", page)
+        self.assertIn("$('model-list').addEventListener('change'", page)
+        self.assertIn("$('model').addEventListener('change'", page)
+        self.assertIn("send('load_models')", page)
+        self.assertNotIn("$('model').value = s.model; $('base-url').value = s.base_url;", page)
+
     def test_page_is_self_contained(self):
         page = ai.PAGE_HTML
         self.assertIn("orca.postMessage", page)

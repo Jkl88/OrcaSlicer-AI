@@ -4,14 +4,15 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "AI Assist"
-# description = "Анализ и правка пресетов с помощью Gemini"
+# description = "Анализ и правка пресетов с помощью ИИ: Gemini, OpenAI-совместимые сервисы, Claude"
 # author = "OrcaSlicer-AI"
-# version = "1.1.0"
+# version = "1.2.0"
 # ///
-"""AI Assist: Gemini-based analysis of the current OrcaSlicer presets.
+"""AI Assist: AI-based analysis of the current OrcaSlicer presets.
 
 The plugin reads an allowlisted subset of the edited print/filament/printer
-presets, asks Gemini for recommendations, validates the answer against a strict
+presets, asks the chosen AI service (Google Gemini, any OpenAI-compatible API or
+Anthropic Claude) for recommendations, validates the answer against a strict
 schema and applies only the rows the user checked, one preset category at a
 time, through OrcaSlicer's preset transaction API (OrcaSlicer 2.5.0+) after a
 native confirmation. Hosts without that API get a manual mode that produces
@@ -22,6 +23,7 @@ it can be tested without OrcaSlicer.
 """
 
 import contextlib
+import copy
 import html
 import http.client
 import json
@@ -46,8 +48,6 @@ if orca is not None and not hasattr(orca, "pages"):
 
 PLUGIN_NAME = "AI Assist"
 CONFIG_FILE = "config.json"
-DEFAULT_MODEL = "gemini-2.5-flash"
-DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 REQUEST_TIMEOUT_S = 60.0
@@ -87,7 +87,7 @@ PRESET_EDITORS = {"print": "process", "filament": "filament", "printer": "printe
 CONFIDENCE_LABELS = {"low": "низкая", "medium": "средняя", "high": "высокая"}
 
 # Settings most often adjusted for print defects. Only these keys are ever read
-# from the presets, sent to Gemini or accepted back from it.
+# from the presets, sent to the AI service or accepted back from it.
 SNAPSHOT_KEYS: Dict[str, Tuple[str, ...]] = {
     "print": (
         "layer_height", "initial_layer_print_height", "wall_loops", "top_shell_layers",
@@ -128,7 +128,7 @@ SENSITIVE_MARKERS = ("apikey", "api_key", "token", "password", "passwd", "secret
                      "username", "user_name", "print_host", "printhost", "webui", "url", "path",
                      "cloud", "auth")
 
-_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
 _API_KEY_RE = re.compile(r"[\x21-\x7e]{1,256}")
 _QUERY_SECRET_RE = re.compile(r"(?i)([?&](?:key|api_key|apikey|token|access_token)=)[^&#\s]+")
 _FENCE_RE = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.S | re.I)
@@ -156,11 +156,30 @@ def _short(text: Any, limit: int = 80) -> str:
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Provider:
+    label: str
+    base_url: str
+    model: str
+    key_hint: str
+
+
+PROVIDERS: Dict[str, Provider] = {
+    "gemini": Provider("Google Gemini", "https://generativelanguage.googleapis.com", "gemini-2.5-flash",
+                       "ключ из Google AI Studio"),
+    "openai": Provider("OpenAI-совместимый", "https://api.openai.com/v1", "",
+                       "ключ сервиса: OpenAI, OpenRouter, DeepSeek, Groq, Mistral…; для Ollama и LM Studio "
+                       "на этом компьютере ключ не нужен"),
+    "anthropic": Provider("Anthropic Claude", "https://api.anthropic.com", "", "ключ из Anthropic Console"),
+}
+DEFAULT_PROVIDER = "gemini"
+
+
 def validate_model(model: str) -> str:
     model = model.strip()
     if not _MODEL_RE.fullmatch(model):
-        raise ValueError("Имя модели может содержать только латинские буквы, цифры, точку, дефис "
-                         "и подчёркивание (например, gemini-2.5-flash).")
+        raise ValueError("Имя модели: латинские буквы, цифры и . _ : / @ + - без пробелов, не длиннее 128 "
+                         "(например, gemini-2.5-flash или openai/gpt-4o).")
     return model
 
 
@@ -187,23 +206,47 @@ def validate_api_key(key: str) -> str:
 
 
 @dataclass
+class ProviderSettings:
+    api_key: str = ""
+    model: str = ""
+    base_url: str = ""
+    consent: bool = False
+
+
+def _default_settings() -> Dict[str, ProviderSettings]:
+    return {pid: ProviderSettings(model=p.model, base_url=p.base_url) for pid, p in PROVIDERS.items()}
+
+
+@dataclass
 class AiConfig:
-    gemini_api_key: str = ""
-    gemini_model: str = DEFAULT_MODEL
-    base_url: str = DEFAULT_BASE_URL
-    preset_data_consent: bool = False
+    provider: str = DEFAULT_PROVIDER
+    settings: Dict[str, ProviderSettings] = field(default_factory=_default_settings)
+
+    @property
+    def active(self) -> ProviderSettings:
+        return self.settings[self.provider]
 
     @classmethod
     def from_dict(cls, data: Mapping) -> "AiConfig":
         """Take every valid field from data; invalid or missing fields keep their defaults."""
         config = cls()
-        for name, validator in (("gemini_api_key", validate_api_key), ("gemini_model", validate_model),
-                                ("base_url", validate_base_url)):
-            value = data.get(name)
-            if isinstance(value, str):
-                with contextlib.suppress(ValueError):
-                    setattr(config, name, validator(value))
-        config.preset_data_consent = data.get("preset_data_consent") is True
+        if data.get("provider") in PROVIDERS:
+            config.provider = data["provider"]
+        stored = data.get("settings")
+        if not isinstance(stored, Mapping) and "gemini_api_key" in data:  # format of plugin 1.0-1.1
+            stored = {"gemini": {"api_key": data.get("gemini_api_key"), "model": data.get("gemini_model"),
+                                 "base_url": data.get("base_url"), "consent": data.get("preset_data_consent")}}
+        for pid, raw in (stored or {}).items():
+            if pid not in PROVIDERS or not isinstance(raw, Mapping):
+                continue
+            target = config.settings[pid]
+            for name, validator in (("api_key", validate_api_key), ("model", validate_model),
+                                    ("base_url", validate_base_url)):
+                value = raw.get(name)
+                if isinstance(value, str):
+                    with contextlib.suppress(ValueError):
+                        setattr(target, name, validator(value))
+            target.consent = raw.get("consent") is True
         return config
 
 
@@ -218,7 +261,7 @@ def load_config(directory: str) -> Tuple[AiConfig, Optional[str]]:
         data = None
     if not isinstance(data, dict):
         return AiConfig(), ("Файл настроек повреждён или недоступен — используются значения по умолчанию. "
-                            "Введите ключ Gemini заново.")
+                            "Введите ключ API заново.")
     return AiConfig.from_dict(data), None
 
 
@@ -330,7 +373,7 @@ INPUT JSON:
 
 
 def build_provider_payload(workspace: Workspace, problem: Optional[str] = None) -> Dict[str, Any]:
-    """The complete data sent to Gemini: preset names, allowlisted values and the defect text."""
+    """The complete data sent to the AI service: preset names, allowlisted values and the defect text."""
     payload: Dict[str, Any] = {
         "presets": {t: workspace.names.get(t, "") for t in PRESET_TYPES},
         "settings": {t: {k: v for k, v in workspace.values.get(t, {}).items()
@@ -348,13 +391,13 @@ def build_prompt(payload: Mapping) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Gemini transport
+# AI provider transport
 # --------------------------------------------------------------------------- #
 class TaskCancelled(Exception):
     pass
 
 
-class GeminiError(Exception):
+class AiError(Exception):
     """Transport/provider failure; the message is user-facing and already redacted."""
 
 
@@ -362,9 +405,13 @@ HTTP_HINTS = {
     400: "некорректный запрос или ключ API",
     401: "ключ API отклонён",
     403: "ключ API отклонён или нет доступа к модели",
-    404: "модель не найдена — проверьте её имя",
+    404: "модель не найдена или неверный адрес API",
     429: "превышен лимит запросов, повторите позже",
 }
+
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_MAX_TOKENS = 4096
+MAX_MODELS = 500
 
 
 def _audit_denial(exc: Any) -> bool:
@@ -373,71 +420,128 @@ def _audit_denial(exc: Any) -> bool:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Redirects would resend the x-goog-api-key header to another URL; refuse them."""
+    """Redirects would resend the API key header to another URL; refuse them."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
-class GeminiClient:
-    def __init__(self, api_key: str, model: str, base_url: str, timeout: float = REQUEST_TIMEOUT_S,
+class AiClient:
+    """One provider/model/key; generate() returns the model text, list_models() the available models."""
+
+    def __init__(self, provider: str, api_key: str, model: str, base_url: str, timeout: float = REQUEST_TIMEOUT_S,
                  io_timeout: float = IO_TIMEOUT_S, max_bytes: int = MAX_RESPONSE_BYTES):
+        if provider not in PROVIDERS:
+            raise ValueError(f"Неизвестный ИИ-сервис: {_short(provider, 40)}")
+        self._provider = provider
+        self._label = PROVIDERS[provider].label
         self._api_key = api_key
-        self._model = validate_model(model)
+        self._model = model
         self._base_url = validate_base_url(base_url)
         self._timeout = timeout
         self._io_timeout = min(io_timeout, timeout)
         self._max_bytes = max_bytes
         self._opener = urllib.request.build_opener(_NoRedirect)
 
+    # public API ----------------------------------------------------------------
     def generate(self, prompt: str, cancel: threading.Event) -> str:
-        """POST the prompt and return the model text; raises GeminiError or TaskCancelled."""
-        if not self._api_key:
-            raise GeminiError("Не задан ключ Gemini API.")
+        """POST the prompt and return the model text; raises AiError or TaskCancelled."""
+        self._require_key()
+        if not self._model:
+            raise AiError("Не выбрана модель — загрузите список моделей и выберите одну.")
         if cancel.is_set():
             raise TaskCancelled()
-        url = f"{self._base_url}/v1beta/models/{urllib.parse.quote(self._model, safe='')}:generateContent"
-        body = json.dumps({
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-        }).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST", headers={
-            "Content-Type": "application/json", "x-goog-api-key": self._api_key})
+        if self._provider == "gemini":
+            path = f"/v1beta/models/{urllib.parse.quote(self._model, safe='')}:generateContent"
+            body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
+        elif self._provider == "openai":
+            path = "/chat/completions"
+            body = {"model": self._model, "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]}
+        else:
+            path = "/v1/messages"
+            body = {"model": self._model, "max_tokens": ANTHROPIC_MAX_TOKENS, "temperature": 0.2,
+                    "messages": [{"role": "user", "content": prompt}]}
+        data = self._request("POST", path, body, cancel)
+        return getattr(self, f"_text_{self._provider}")(data)
+
+    def list_models(self, cancel: threading.Event) -> List[str]:
+        """Model IDs this key can use, sorted; raises AiError or TaskCancelled."""
+        self._require_key()
+        path = {"gemini": "/v1beta/models?pageSize=1000", "openai": "/models",
+                "anthropic": "/v1/models?limit=1000"}[self._provider]
+        data = self._request("GET", path, None, cancel)
+        if self._provider == "gemini":
+            items = data.get("models") if isinstance(data, dict) else None
+            ids = [m["name"].split("/", 1)[-1] for m in items or ()
+                   if isinstance(m, dict) and isinstance(m.get("name"), str)
+                   and "generateContent" in (m.get("supportedGenerationMethods") or ())]
+        else:
+            items = data.get("data") if isinstance(data, dict) else None
+            ids = [m["id"] for m in items or () if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        valid = set()
+        for model_id in ids:
+            with contextlib.suppress(ValueError):
+                valid.add(validate_model(model_id))
+        return sorted(valid)[:MAX_MODELS]
+
+    # transport -----------------------------------------------------------------
+    def _require_key(self) -> None:
+        local = urllib.parse.urlsplit(self._base_url).hostname in LOCAL_HOSTS
+        if not self._api_key and not (self._provider == "openai" and local):
+            raise AiError(f"Не задан ключ API для {self._label}.")
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._provider == "gemini":
+            headers["x-goog-api-key"] = self._api_key
+        elif self._provider == "anthropic":
+            headers.update({"x-api-key": self._api_key, "anthropic-version": ANTHROPIC_VERSION})
+        elif self._api_key:
+            headers["Authorization"] = "Bearer " + self._api_key
+        return headers
+
+    def _request(self, method: str, path: str, body: Optional[dict], cancel: threading.Event) -> Any:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(self._base_url + path, data=data, method=method, headers=self._headers())
         deadline = time.monotonic() + self._timeout
         try:
             with self._opener.open(request, timeout=self._io_timeout) as response:
                 raw = self._read_bounded(response, deadline, cancel)
         except urllib.error.HTTPError as exc:
-            raise GeminiError(self._http_error_message(exc)) from None
+            raise AiError(self._http_error_message(exc)) from None
         except TimeoutError:
-            raise GeminiError(self._timeout_message()) from None
+            raise AiError(self._timeout_message()) from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
-                raise GeminiError(self._timeout_message()) from None
+                raise AiError(self._timeout_message()) from None
             if _audit_denial(exc.reason):
-                raise GeminiError(self._permission_message()) from None
-            raise GeminiError(self._redact(f"Не удалось подключиться к Gemini: {exc.reason}")) from None
+                raise AiError(self._permission_message()) from None
+            raise AiError(self._redact(f"Не удалось подключиться к {self._label}: {exc.reason}")) from None
         except (OSError, http.client.HTTPException) as exc:
             if _audit_denial(exc):
-                raise GeminiError(self._permission_message()) from None
-            raise GeminiError(self._redact(f"Ошибка сети при обращении к Gemini: {exc}")) from None
+                raise AiError(self._permission_message()) from None
+            raise AiError(self._redact(f"Ошибка сети при обращении к {self._label}: {exc}")) from None
         if cancel.is_set():
             raise TaskCancelled()
-        return self._extract_text(raw)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise AiError(f"{self._label} вернул ответ не в формате JSON.") from None
 
     def _redact(self, text: str) -> str:
         return redact(text, [self._api_key])
 
     def _permission_message(self) -> str:
         host = urllib.parse.urlsplit(self._base_url).hostname
-        return (f"OrcaSlicer заблокировал доступ плагина к {host}: разрешите его в окне «Плагины» "
-                "и повторите запрос.")
+        return (f"OrcaSlicer заблокировал доступ плагина к {host}: подтвердите доступ в окне OrcaSlicer или "
+                "в окне «Плагины» и повторите запрос.")
 
     def _timeout_message(self) -> str:
-        return f"Gemini не ответил вовремя (лимит {int(self._timeout)} с)."
+        return f"{self._label} не ответил вовремя (лимит {int(self._timeout)} с)."
 
     def _read_bounded(self, response, deadline: float, cancel: threading.Event) -> bytes:
-        too_big = GeminiError(f"Ответ Gemini больше {self._max_bytes // 1024} КиБ — запрос прерван.")
+        too_big = AiError(f"Ответ {self._label} больше {self._max_bytes // 1024} КиБ — запрос прерван.")
         length = response.headers.get("Content-Length")
         if length and length.isdigit() and int(length) > self._max_bytes:
             raise too_big
@@ -469,27 +573,43 @@ class GeminiClient:
         if 300 <= code < 400:
             hint = "перенаправление запросов запрещено — проверьте адрес API"
         else:
-            hint = HTTP_HINTS.get(code, "сервер Gemini временно недоступен" if code >= 500 else "запрос отклонён")
-        return self._redact(f"Ошибка Gemini (HTTP {code}): {hint}." + (f" {detail}" if detail else ""))
+            hint = HTTP_HINTS.get(code, "сервер временно недоступен" if code >= 500 else "запрос отклонён")
+        return self._redact(f"Ошибка {self._label} (HTTP {code}): {hint}." + (f" {detail}" if detail else ""))
 
-    def _extract_text(self, raw: bytes) -> str:
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except ValueError:
-            raise GeminiError("Gemini вернул ответ не в формате JSON.") from None
+    # response parsing ----------------------------------------------------------
+    def _empty(self, reason: Any) -> AiError:
+        return AiError(self._redact(f"{self._label} вернул пустой ответ (причина: {_short(reason)})."))
+
+    def _text_gemini(self, data: Any) -> str:
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
             feedback = data.get("promptFeedback") if isinstance(data, dict) else None
             reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
             if reason:
-                raise GeminiError(self._redact(f"Gemini заблокировал запрос: {_short(reason)}."))
-            raise GeminiError("Gemini не вернул ни одного варианта ответа.")
+                raise AiError(self._redact(f"{self._label} заблокировал запрос: {_short(reason)}."))
+            raise AiError(f"{self._label} не вернул ни одного варианта ответа.")
         content = candidates[0].get("content")
         parts = content.get("parts") if isinstance(content, dict) else None
         text = "".join(p["text"] for p in parts or () if isinstance(p, dict) and isinstance(p.get("text"), str))
         if not text.strip():
-            finish = candidates[0].get("finishReason")
-            raise GeminiError(self._redact(f"Gemini вернул пустой ответ (finishReason: {_short(finish)})."))
+            raise self._empty(candidates[0].get("finishReason"))
+        return text
+
+    def _text_openai(self, data: Any) -> str:
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise AiError(f"{self._label} не вернул ни одного варианта ответа.")
+        message = choices[0].get("message")
+        text = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise self._empty(choices[0].get("finish_reason"))
+        return text
+
+    def _text_anthropic(self, data: Any) -> str:
+        blocks = data.get("content") if isinstance(data, dict) else None
+        text = "".join(b["text"] for b in blocks or () if isinstance(b, dict) and isinstance(b.get("text"), str))
+        if not text.strip():
+            raise self._empty(data.get("stop_reason") if isinstance(data, dict) else None)
         return text
 
 
@@ -760,6 +880,8 @@ class AiAssistApp:
         self._config = AiConfig()
         self._config_warning: Optional[str] = None
         self._tasks: Optional[TaskController] = None
+        self._model_tasks: Optional[TaskController] = None
+        self._models: Dict[str, List[str]] = {}
         self._analysis: Optional[Analysis] = None
         self._applying = False
         self._loaded = False
@@ -776,6 +898,7 @@ class AiAssistApp:
         else:
             self._config, self._config_warning = AiConfig(), None
         self._tasks = TaskController(self._on_task_done)
+        self._model_tasks = TaskController(self._on_models_done)
         self._analysis = None
         self._applying = False
         self._loaded = True
@@ -784,7 +907,9 @@ class AiAssistApp:
         if not self._loaded:
             return True
         self._loaded = False
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         stopped = self._tasks.shutdown(SHUTDOWN_TIMEOUT_S)
+        stopped = self._model_tasks.shutdown(max(0.0, deadline - time.monotonic())) and stopped
         self._analysis = None
         return stopped
 
@@ -809,7 +934,7 @@ class AiAssistApp:
         handler = {
             "init": self._on_init, "save_settings": self._on_save_settings, "consent": self._on_consent,
             "analyze": self._on_analyze, "diagnose": self._on_diagnose, "cancel": self._on_cancel,
-            "apply": self._on_apply,
+            "apply": self._on_apply, "load_models": self._on_load_models,
         }.get(kind)
         if handler is None:
             return
@@ -824,25 +949,53 @@ class AiAssistApp:
             self._post_analysis(self._analysis)
 
     def _on_save_settings(self, message: dict) -> None:
-        updated = replace(self._config)
-        try:
-            key = message.get("api_key")
-            if message.get("clear_key") is True:
-                updated.gemini_api_key = ""
-            elif isinstance(key, str) and key.strip():
-                updated.gemini_api_key = validate_api_key(key)
-            updated.gemini_model = validate_model(str(message.get("model") or DEFAULT_MODEL))
-            updated.base_url = validate_base_url(str(message.get("base_url") or DEFAULT_BASE_URL))
-        except ValueError as exc:
-            self._status("error", str(exc))
-            return
+        """Apply every valid field; an invalid one is reported but never blocks saving the others."""
+        updated = copy.deepcopy(self._config)
+        provider = message.get("provider")
+        if provider is not None:
+            if provider not in PROVIDERS:
+                return self._status("error", "Неизвестный ИИ-сервис.")
+            updated.provider = provider
+        settings, errors = updated.active, []
+        fields = (("api_key", validate_api_key), ("model", validate_model), ("base_url", validate_base_url))
+        for name, validator in fields:
+            value = message.get(name)
+            if not isinstance(value, str):
+                continue
+            if not value.strip():
+                if name == "base_url":
+                    settings.base_url = PROVIDERS[updated.provider].base_url
+                elif name == "model":
+                    settings.model = ""
+                continue
+            try:
+                setattr(settings, name, validator(value))
+            except ValueError as exc:
+                errors.append(str(exc))
+        if message.get("clear_key") is True:
+            settings.api_key = ""
         self._store_config(updated, "Настройки сохранены.")
+        if errors:
+            self._status("error", "Остальное сохранено, но " + " ".join(errors))
 
     def _on_consent(self, message: dict) -> None:
         granted = message.get("value") is True
-        self._store_config(replace(self._config, preset_data_consent=granted),
-                           "Согласие на отправку данных в Gemini получено." if granted
-                           else "Согласие отозвано: запросы к Gemini отключены.")
+        updated = copy.deepcopy(self._config)
+        updated.active.consent = granted
+        label = PROVIDERS[updated.provider].label
+        self._store_config(updated, f"Согласие на отправку данных в {label} получено." if granted
+                           else f"Согласие отозвано: запросы к {label} отключены.")
+
+    def _client(self) -> AiClient:
+        settings = self._config.active
+        return AiClient(self._config.provider, settings.api_key, settings.model, settings.base_url)
+
+    def _on_load_models(self, _message: dict) -> None:
+        provider = self._config.provider
+        client = self._client()
+        self._status("info", f"Загружаем список моделей {PROVIDERS[provider].label}…")
+        self._model_tasks.submit("models", lambda cancel: (provider, client.list_models(cancel)))
+        self._post_state()
 
     def _store_config(self, updated: AiConfig, ok_text: str) -> None:
         if self._storage_dir is None:
@@ -872,13 +1025,15 @@ class AiAssistApp:
             self._start_request("diagnose", problem)
 
     def _start_request(self, kind: str, problem: Optional[str]) -> None:
-        config = self._config
+        settings, label = self._config.active, PROVIDERS[self._config.provider].label
         if self._features.mode == MODE_UNAVAILABLE:
             return self._status("error", MODE_TEXT[MODE_UNAVAILABLE])
-        if not config.gemini_api_key:
-            return self._status("error", "Сначала укажите ключ Gemini API в настройках.")
-        if not config.preset_data_consent:
-            return self._status("error", "Подтвердите согласие на отправку данных в Gemini.")
+        if not settings.api_key and not self._local_openai():
+            return self._status("error", f"Сначала укажите ключ API для {label} в настройках.")
+        if not settings.model:
+            return self._status("error", "Выберите модель: загрузите список моделей или введите имя вручную.")
+        if not settings.consent:
+            return self._status("error", f"Подтвердите согласие на отправку данных в {label}.")
         try:
             workspace = capture_workspace(self._host, self._features)
         except Exception as exc:
@@ -886,16 +1041,23 @@ class AiAssistApp:
         if not any(workspace.values.values()):
             return self._status("error", "Не удалось прочитать ни одного параметра текущих пресетов.")
         prompt = build_prompt(build_provider_payload(workspace, problem))
-        client = GeminiClient(config.gemini_api_key, config.gemini_model, config.base_url)
+        client = self._client()
         self._request_counter += 1
         prefix = f"r{self._request_counter}"
         self._analysis = None
         self._post({"type": "analysis", "summary": "", "rows": []})
         # Posted before submit() so a fast worker's result can never be followed by a stale busy state.
-        self._status("info", "Запрос к Gemini отправлен, ждём ответ…")
+        self._status("info", f"Запрос к {label} отправлен, ждём ответ…")
         self._post_state(busy=True)
         self._tasks.submit(kind, lambda cancel: parse_recommendations(client.generate(prompt, cancel),
                                                                       workspace, prefix))
+
+    def _local_openai(self) -> bool:
+        host = urllib.parse.urlsplit(self._config.active.base_url).hostname
+        return self._config.provider == "openai" and host in LOCAL_HOSTS
+
+    def _secrets(self) -> List[str]:
+        return [s.api_key for s in self._config.settings.values() if s.api_key]
 
     def _on_cancel(self, _message: dict) -> None:
         if self._tasks.cancel_current():
@@ -907,7 +1069,7 @@ class AiAssistApp:
         if analysis is None or not analysis.recommendations:
             return self._status("error", "Нет рекомендаций — сначала запустите анализ.")
         if self._tasks.busy:
-            return self._status("error", "Дождитесь завершения текущего запроса к Gemini.")
+            return self._status("error", "Дождитесь завершения текущего запроса к ИИ-сервису.")
         rows = select_rows(analysis.recommendations, message.get("selected"))
         if self._features.mode != MODE_AUTOMATIC:
             if not rows:
@@ -956,10 +1118,23 @@ class AiAssistApp:
             count = len(value.recommendations)
             self._status("ok", f"Получено рекомендаций: {count}. Отметьте нужные строки." if count
                          else "Модель не предложила изменений.")
-        elif isinstance(value, (GeminiError, ResponseError)):
-            self._status("error", redact(value, [self._config.gemini_api_key]))
+        elif isinstance(value, (AiError, ResponseError)):
+            self._status("error", redact(value, self._secrets()))
         else:
             self._status("error", f"Непредвиденная ошибка: {type(value).__name__}.")
+        self._post_state()
+
+    def _on_models_done(self, _generation: int, _kind: str, ok: bool, value: Any) -> None:
+        if ok:
+            provider, models = value
+            self._models[provider] = models
+            self._post({"type": "models", "provider": provider, "models": models})
+            self._status("ok", f"Найдено моделей: {len(models)}. Выберите модель в списке." if models
+                         else "Сервис не вернул ни одной подходящей модели — введите имя вручную.")
+        elif isinstance(value, AiError):
+            self._status("error", "Не удалось загрузить список моделей: " + redact(value, self._secrets()))
+        else:
+            self._status("error", f"Не удалось загрузить список моделей: {type(value).__name__}.")
         self._post_state()
 
     def _on_applied(self, ok: bool, value: Any) -> None:
@@ -991,10 +1166,14 @@ class AiAssistApp:
             "storage_ok": self._storage_dir is not None,
             "storage_text": STORAGE_OK_TEXT if self._storage_dir else STORAGE_MISSING_TEXT,
             "config_warning": self._config_warning or "",
-            "key_set": bool(self._config.gemini_api_key),
-            "model": self._config.gemini_model,
-            "base_url": self._config.base_url,
-            "consent": self._config.preset_data_consent,
+            "provider": self._config.provider,
+            "providers": [{"id": pid, "label": p.label, "key_hint": p.key_hint} for pid, p in PROVIDERS.items()],
+            "key_set": bool(self._config.active.api_key),
+            "model": self._config.active.model,
+            "base_url": self._config.active.base_url,
+            "consent": self._config.active.consent,
+            "models": self._models.get(self._config.provider, []),
+            "models_busy": self._model_tasks.busy,
             "busy": self._tasks.busy if busy is None else busy,
         })
 
@@ -1044,19 +1223,24 @@ ul { margin: 4px 0; padding-left: 20px; }
 <div id="mode" class="banner">Загрузка…</div>
 
 <section>
-  <h2>Настройки Gemini</h2>
+  <h2>ИИ-сервис</h2>
   <div id="storage" class="muted"></div>
-  <label for="api-key">Ключ Gemini API (<span id="key-state">не задан</span>)</label>
-  <input id="api-key" type="password" autocomplete="off" placeholder="Вставьте ключ из Google AI Studio">
-  <label for="model">Модель</label>
-  <input id="model" type="text" autocomplete="off">
+  <label for="provider">Сервис</label>
+  <select id="provider"></select>
+  <label for="api-key">Ключ API (<span id="key-state">не задан</span>)</label>
+  <input id="api-key" type="password" autocomplete="off" placeholder="Вставьте ключ API">
+  <div id="key-hint" class="muted"></div>
   <label for="base-url">Адрес API</label>
   <input id="base-url" type="text" autocomplete="off">
+  <label for="model-list">Модель</label>
+  <select id="model-list"></select> <button id="load-models">Загрузить модели</button>
+  <label for="model">или имя модели вручную</label>
+  <input id="model" type="text" autocomplete="off" placeholder="например, gemini-2.5-flash или openai/gpt-4o">
   <button id="save">Сохранить</button><button id="clear-key">Удалить ключ</button>
 </section>
 
 <section>
-  <h2>Какие данные уходят в Google Gemini</h2>
+  <h2>Какие данные уходят в ИИ-сервис</h2>
   <ul>
     <li>имена текущих пресетов процесса, пластика и принтера;</li>
     <li>текущие значения разрешённых параметров (список ниже);</li>
@@ -1064,7 +1248,7 @@ ul { margin: 4px 0; padding-left: 20px; }
   </ul>
   <div class="muted">Не отправляются: ключи и пароли, адреса хостов печати, пути к файлам, G-code и модели.</div>
   <details><summary>Разрешённые параметры</summary>__ALLOWED_KEYS__</details>
-  <label><input id="consent" type="checkbox"> Я согласен отправлять эти данные в Google Gemini</label>
+  <label><input id="consent" type="checkbox"> Я согласен отправлять эти данные в <span id="provider-label">выбранный ИИ-сервис</span></label>
 </section>
 
 <section>
@@ -1125,12 +1309,35 @@ ul { margin: 4px 0; padding-left: 20px; }
     $('mode').textContent = s.mode_text; $('mode').className = 'banner ' + s.mode;
     $('storage').textContent = s.storage_text + (s.config_warning ? ' ' + s.config_warning : '');
     $('key-state').textContent = s.key_set ? 'задан' : 'не задан';
-    $('model').value = s.model; $('base-url').value = s.base_url;
+    var provider = (s.providers || []).filter(function (p) { return p.id === s.provider; })[0] || {};
+    if ($('provider').options.length !== (s.providers || []).length) {
+      $('provider').textContent = '';
+      (s.providers || []).forEach(function (p) { var o = document.createElement('option'); o.value = p.id; o.textContent = p.label; $('provider').appendChild(o); });
+    }
+    $('provider').value = s.provider;
+    $('provider-label').textContent = provider.label || 'выбранный ИИ-сервис';
+    $('key-hint').textContent = provider.key_hint ? 'Нужен ' + provider.key_hint + '.' : '';
+    if (document.activeElement !== $('model')) $('model').value = s.model;
+    if (document.activeElement !== $('base-url')) $('base-url').value = s.base_url;
+    renderModels(s.models || [], s.model);
+    $('load-models').disabled = !!s.models_busy;
     $('consent').checked = !!s.consent;
+    if (s.key_set && !(s.models || []).length && !s.models_busy && !requested[s.provider]) {
+      requested[s.provider] = true; send('load_models');
+    }
     var blocked = s.busy || s.mode === 'unavailable';
     $('analyze').disabled = blocked; $('diagnose').disabled = blocked;
     $('cancel').hidden = !s.busy;
     updateApply();
+  }
+  var requested = {};
+  function renderModels(models, current) {
+    var list = $('model-list'), names = models.slice();
+    if (current && names.indexOf(current) < 0) names.unshift(current);
+    list.textContent = '';
+    if (!names.length) { var empty = document.createElement('option'); empty.value = ''; empty.textContent = 'нет загруженных моделей'; list.appendChild(empty); }
+    names.forEach(function (m) { var o = document.createElement('option'); o.value = m; o.textContent = m; list.appendChild(o); });
+    list.value = current || '';
   }
   function renderAnalysis(d) {
     var body = $('rows'); body.textContent = '';
@@ -1159,9 +1366,18 @@ ul { margin: 4px 0; padding-left: 20px; }
   }
 
   $('save').addEventListener('click', function () {
+    var withKey = !!$('api-key').value.trim() || state.key_set;
     send('save_settings', { api_key: $('api-key').value, model: $('model').value, base_url: $('base-url').value });
     $('api-key').value = '';
+    if (withKey) { requested[state.provider] = true; send('load_models'); }
   });
+  $('provider').addEventListener('change', function () { send('save_settings', { provider: $('provider').value }); });
+  $('model-list').addEventListener('change', function () {
+    if ($('model-list').value) send('save_settings', { model: $('model-list').value });
+  });
+  $('model').addEventListener('change', function () { send('save_settings', { model: $('model').value }); });
+  $('base-url').addEventListener('change', function () { send('save_settings', { base_url: $('base-url').value }); });
+  $('load-models').addEventListener('click', function () { send('load_models'); });
   $('clear-key').addEventListener('click', function () {
     send('save_settings', { clear_key: true, model: $('model').value, base_url: $('base-url').value });
     $('api-key').value = '';
@@ -1226,5 +1442,6 @@ if orca is not None:
     class AiAssistPlugin(orca.base):
         def register_capabilities(self):
             if callable(getattr(orca, "request_permissions", None)):
-                orca.request_permissions(network=[DEFAULT_BASE_URL], threading=True)
+                hosts = [urllib.parse.urlsplit(p.base_url) for p in PROVIDERS.values()]
+                orca.request_permissions(network=[f"{u.scheme}://{u.hostname}" for u in hosts], threading=True)
             orca.register_capability(AiAssistPage)

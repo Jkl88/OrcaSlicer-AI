@@ -11,7 +11,7 @@ PLUGIN_PATH = Path(__file__).resolve().parents[1] / "orca_ai_assist.py"
 API_KEY = "AIzaTESTKEY-123"
 
 
-def load_plugin(name="orca_ai_assist_gemini"):
+def load_plugin(name="orca_ai_assist_providers"):
     spec = importlib.util.spec_from_file_location(name, PLUGIN_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -26,7 +26,18 @@ def gemini_body(text):
     return {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}
 
 
-class FakeGemini:
+def openai_body(text):
+    return {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+
+def anthropic_body(text):
+    return {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
+
+
+ANSWER_BODIES = {"gemini": gemini_body, "openai": openai_body, "anthropic": anthropic_body}
+
+
+class FakeProvider:
     """Local HTTP server; `reply(handler)` returns (status, body bytes or JSON value, extra headers)."""
 
     def __init__(self):
@@ -35,15 +46,14 @@ class FakeGemini:
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", 0))
-                fake.requests.append({"path": self.path, "headers": dict(self.headers),
-                                      "body": json.loads(self.rfile.read(length) or b"null")})
+            def handle_request(self, body):
+                fake.requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers),
+                                      "body": body})
                 reply = fake.reply(self)
                 if reply is None:  # the reply function already wrote the response
                     return
-                status, body, headers = reply
-                data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+                status, data, headers = reply
+                data = data if isinstance(data, bytes) else json.dumps(data).encode("utf-8")
                 try:
                     self.send_response(status)
                     for name, value in headers.items():
@@ -53,6 +63,13 @@ class FakeGemini:
                     self.wfile.write(data)
                 except OSError:
                     pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                self.handle_request(json.loads(self.rfile.read(length) or b"null"))
+
+            def do_GET(self):
+                self.handle_request(None)
 
             def log_message(self, *args):
                 pass
@@ -68,32 +85,43 @@ class FakeGemini:
         self.server.server_close()
 
 
-class GeminiClientTests(unittest.TestCase):
+FakeGemini = FakeProvider
+
+
+class ProviderTestCase(unittest.TestCase):
+    provider = "gemini"
+    model = "gemini-2.5-flash"
+
     def setUp(self):
-        self.fake = FakeGemini()
+        self.fake = FakeProvider()
         self.addCleanup(self.fake.close)
 
-    def client(self, **kwargs):
-        return ai.GeminiClient(API_KEY, "gemini-2.5-flash", self.fake.base_url, **kwargs)
+    def client(self, key=API_KEY, model=None, base_url=None, **kwargs):
+        return ai.AiClient(self.provider, key, model or self.model, base_url or self.fake.base_url, **kwargs)
 
     def generate(self, client=None, cancel=None):
         return (client or self.client()).generate("PROMPT", cancel or threading.Event())
 
     def assert_error(self, fragment, client=None):
-        with self.assertRaises(ai.GeminiError) as ctx:
+        with self.assertRaises(ai.AiError) as ctx:
             self.generate(client)
         message = str(ctx.exception)
         self.assertIn(fragment, message)
         self.assertNotIn(API_KEY, message)
         return message
 
+    def headers(self, index=0):
+        return {k.lower(): v for k, v in self.fake.requests[index]["headers"].items()}
+
+
+class GeminiClientTests(ProviderTestCase):
     def test_request_shape_and_key_header(self):
         self.fake.reply = lambda h: (200, gemini_body("part1"), {})
         self.assertEqual(self.generate(), "part1")
         request = self.fake.requests[0]
         self.assertEqual(request["path"], "/v1beta/models/gemini-2.5-flash:generateContent")
         self.assertNotIn(API_KEY, request["path"])
-        headers = {k.lower(): v for k, v in request["headers"].items()}
+        headers = self.headers()
         self.assertEqual(headers["x-goog-api-key"], API_KEY)
         self.assertEqual(headers["content-type"], "application/json")
         body = request["body"]
@@ -115,6 +143,7 @@ class GeminiClientTests(unittest.TestCase):
                 message = self.assert_error(fragment)
                 self.assertIn(f"HTTP {code}", message)
                 self.assertIn("rejected", message)
+                self.assertIn("Google Gemini", message)
 
     def test_redirect_not_followed(self):
         self.fake.reply = lambda h: (302, b"", {"Location": self.fake.base_url + "/elsewhere"})
@@ -162,9 +191,8 @@ class GeminiClientTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.9)
 
     def test_connection_refused(self):
-        client = ai.GeminiClient(API_KEY, "m", "http://127.0.0.1:1")
-        with self.assertRaises(ai.GeminiError) as ctx:
-            client.generate("p", threading.Event())
+        with self.assertRaises(ai.AiError) as ctx:
+            self.client(base_url="http://127.0.0.1:1").generate("p", threading.Event())
         self.assertIn("подключиться", str(ctx.exception))
 
     def test_cancel_before_send(self):
@@ -186,14 +214,103 @@ class GeminiClientTests(unittest.TestCase):
             self.generate(cancel=cancel)
 
     def test_missing_key(self):
-        client = ai.GeminiClient("", "m", self.fake.base_url)
-        with self.assertRaises(ai.GeminiError):
-            client.generate("p", threading.Event())
+        with self.assertRaises(ai.AiError):
+            self.client(key="").generate("p", threading.Event())
         self.assertEqual(self.fake.requests, [])
 
     def test_insecure_remote_url_rejected(self):
         with self.assertRaises(ValueError):
-            ai.GeminiClient(API_KEY, "m", "http://generativelanguage.googleapis.com")
+            ai.AiClient("gemini", API_KEY, "m", "http://generativelanguage.googleapis.com")
+
+    def test_list_models_keeps_generate_content_models(self):
+        models = {"models": [
+            {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent", "countTokens"]},
+            {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/bad name", "supportedGenerationMethods": ["generateContent"]}]}
+        self.fake.reply = lambda h: (200, models, {})
+        self.assertEqual(self.client().list_models(threading.Event()), ["gemini-2.5-flash", "gemini-2.5-pro"])
+        request = self.fake.requests[0]
+        self.assertEqual((request["method"], request["path"]), ("GET", "/v1beta/models?pageSize=1000"))
+        self.assertEqual(self.headers()["x-goog-api-key"], API_KEY)
+
+
+class OpenAiCompatibleClientTests(ProviderTestCase):
+    provider = "openai"
+    model = "openai/gpt-4o-mini"
+
+    def test_chat_completion_shape(self):
+        self.fake.reply = lambda h: (200, openai_body("answer"), {})
+        self.assertEqual(self.generate(), "answer")
+        request = self.fake.requests[0]
+        self.assertEqual((request["method"], request["path"]), ("POST", "/chat/completions"))
+        self.assertEqual(self.headers()["authorization"], "Bearer " + API_KEY)
+        body = request["body"]
+        self.assertEqual(body["model"], "openai/gpt-4o-mini")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "PROMPT"}])
+        self.assertNotIn(API_KEY, json.dumps(body))
+
+    def test_local_server_without_key(self):
+        self.fake.reply = lambda h: (200, openai_body("local"), {})
+        self.assertEqual(self.client(key="", model="llama3.1:8b").generate("p", threading.Event()), "local")
+        self.assertNotIn("authorization", self.headers())
+
+    def test_remote_server_needs_key(self):
+        with self.assertRaises(ai.AiError):
+            ai.AiClient("openai", "", "m", "https://api.openai.com/v1").generate("p", threading.Event())
+
+    def test_empty_choice_is_reported(self):
+        self.fake.reply = lambda h: (200, {"choices": []}, {})
+        self.assert_error("ни одного варианта")
+        self.fake.reply = lambda h: (200, {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}, {})
+        self.assert_error("length")
+
+    def test_error_message_is_redacted(self):
+        self.fake.reply = lambda h: (401, {"error": {"message": f"Incorrect API key {API_KEY}"}}, {})
+        message = self.assert_error("401")
+        self.assertIn("Incorrect API key", message)
+
+    def test_list_models(self):
+        self.fake.reply = lambda h: (200, {"data": [{"id": "gpt-4o"}, {"id": "llama3.1:8b"}, {"id": 5}]}, {})
+        self.assertEqual(self.client().list_models(threading.Event()), ["gpt-4o", "llama3.1:8b"])
+        request = self.fake.requests[0]
+        self.assertEqual((request["method"], request["path"]), ("GET", "/models"))
+        self.assertEqual(self.headers()["authorization"], "Bearer " + API_KEY)
+
+
+class AnthropicClientTests(ProviderTestCase):
+    provider = "anthropic"
+    model = "claude-model"
+
+    def test_messages_shape(self):
+        self.fake.reply = lambda h: (200, anthropic_body("claude"), {})
+        self.assertEqual(self.generate(), "claude")
+        request = self.fake.requests[0]
+        self.assertEqual((request["method"], request["path"]), ("POST", "/v1/messages"))
+        headers = self.headers()
+        self.assertEqual(headers["x-api-key"], API_KEY)
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        body = request["body"]
+        self.assertEqual(body["model"], "claude-model")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "PROMPT"}])
+        self.assertGreater(body["max_tokens"], 0)
+
+    def test_empty_content_is_reported(self):
+        self.fake.reply = lambda h: (200, {"content": [], "stop_reason": "max_tokens"}, {})
+        self.assert_error("max_tokens")
+
+    def test_list_models(self):
+        self.fake.reply = lambda h: (200, {"data": [{"id": "claude-b"}, {"id": "claude-a"}]}, {})
+        self.assertEqual(self.client().list_models(threading.Event()), ["claude-a", "claude-b"])
+        request = self.fake.requests[0]
+        self.assertEqual((request["method"], request["path"]), ("GET", "/v1/models?limit=1000"))
+        self.assertEqual(self.headers()["x-api-key"], API_KEY)
+
+
+class UnknownProviderTests(unittest.TestCase):
+    def test_unknown_provider_rejected(self):
+        with self.assertRaises(ValueError):
+            ai.AiClient("acme", API_KEY, "m", "https://acme.example")
 
 
 class TaskControllerTests(unittest.TestCase):
@@ -224,13 +341,13 @@ class TaskControllerTests(unittest.TestCase):
 
     def test_errors_are_delivered(self):
         def fail(cancel):
-            raise ai.GeminiError("boom")
+            raise ai.AiError("boom")
 
         self.tasks.submit("x", fail)
         self.assertTrue(self.delivered_event.wait(2))
         kind, ok, value = self.delivered[0]
         self.assertFalse(ok)
-        self.assertIsInstance(value, ai.GeminiError)
+        self.assertIsInstance(value, ai.AiError)
         self.assertFalse(self.tasks.busy)
 
     def test_cancel_suppresses_result(self):
