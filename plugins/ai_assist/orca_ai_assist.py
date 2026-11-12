@@ -6,15 +6,16 @@
 # name = "AI Assist"
 # description = "Анализ и правка пресетов с помощью Gemini"
 # author = "OrcaSlicer-AI"
-# version = "1.0.0"
+# version = "1.1.0"
 # ///
 """AI Assist: Gemini-based analysis of the current OrcaSlicer presets.
 
 The plugin reads an allowlisted subset of the edited print/filament/printer
 presets, asks Gemini for recommendations, validates the answer against a strict
-schema and applies only the rows the user checked, through the host's
-user-confirmed preset transaction API. Hosts without that API get a manual mode
-that produces copyable instructions instead.
+schema and applies only the rows the user checked, one preset category at a
+time, through OrcaSlicer's preset transaction API (OrcaSlicer 2.5.0+) after a
+native confirmation. Hosts without that API get a manual mode that produces
+copyable instructions instead.
 
 Everything except the Orca capability classes at the bottom is plain Python so
 it can be tested without OrcaSlicer.
@@ -34,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
     import orca
@@ -62,29 +63,27 @@ MAX_NAME_CHARS = 200
 MAX_RECOMMENDATIONS = 20
 MAX_PROBLEM_CHARS = 4000
 
-FEATURE_STORAGE = "plugin_storage.v1"
-FEATURE_SNAPSHOT = "preset_snapshot.v1"
-FEATURE_TRANSACTION = "preset_transaction.v1"
-FEATURE_VALUES = "preset_values.v1"
-
 MODE_AUTOMATIC = "automatic"
 MODE_MANUAL = "manual"
 MODE_UNAVAILABLE = "unavailable"
 
 MODE_TEXT = {
-    MODE_AUTOMATIC: "Автоматический режим: отмеченные изменения применяются через OrcaSlicer после "
-                    "подтверждения в отдельном окне. Пресеты не сохраняются автоматически.",
+    MODE_AUTOMATIC: "Автоматический режим: отмеченные изменения применяются по отдельности для процесса, "
+                    "пластика и принтера после подтверждения в окне OrcaSlicer. Пресеты не сохраняются "
+                    "автоматически.",
     MODE_MANUAL: "Ручной режим: эта версия OrcaSlicer не позволяет плагинам менять пресеты. "
                  "Рекомендации можно скопировать и перенести вручную.",
     MODE_UNAVAILABLE: "Эта версия OrcaSlicer не даёт плагинам читать пресеты — анализ недоступен.",
 }
 STORAGE_OK_TEXT = "Настройки хранятся в личной папке плагина."
-STORAGE_MISSING_TEXT = ("Настройки нельзя сохранить: OrcaSlicer не предоставляет хранилище плагина "
-                        "(plugin_storage.v1). Ключ и согласие действуют только до перезапуска программы.")
+STORAGE_MISSING_TEXT = ("Настройки нельзя сохранить: эта версия OrcaSlicer не предоставляет хранилище плагина "
+                        "(нужен OrcaSlicer 2.5.0 или новее). Ключ и согласие действуют только до перезапуска "
+                        "программы.")
 
 PRESET_TYPES = ("print", "filament", "printer")
 CATEGORY_LABELS = {"print": "Процесс", "filament": "Пластик", "printer": "Принтер"}
-LEGACY_COLLECTIONS = {"print": "prints", "filament": "filaments", "printer": "printers"}
+BUNDLE_COLLECTIONS = {"print": "prints", "filament": "filaments", "printer": "printers"}
+PRESET_EDITORS = {"print": "process", "filament": "filament", "printer": "printer"}
 CONFIDENCE_LABELS = {"low": "низкая", "medium": "средняя", "high": "высокая"}
 
 # Settings most often adjusted for print defects. Only these keys are ever read
@@ -246,42 +245,28 @@ def save_config(directory: str, config: AiConfig) -> None:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class HostFeatures:
-    features: FrozenSet[str] = frozenset()
-    legacy_read: bool = False
+    read: bool = False
+    mutate: bool = False
+    storage: bool = False
 
     @classmethod
     def discover(cls, host: Any) -> "HostFeatures":
-        legacy = callable(getattr(host, "preset_bundle", None))
-        try:
-            info = host.api_info()
-        except Exception:
-            return cls(frozenset(), legacy)
-        features = info.get("features") if isinstance(info, dict) else None
-        if not isinstance(features, (list, tuple)):
-            return cls(frozenset(), legacy)
-        return cls(frozenset(f for f in features if isinstance(f, str)), legacy)
-
-    @property
-    def storage(self) -> bool:
-        return FEATURE_STORAGE in self.features
-
-    @property
-    def snapshot(self) -> bool:
-        return FEATURE_SNAPSHOT in self.features
+        read = callable(getattr(host, "preset_bundle", None))
+        editor = getattr(getattr(host, "preset", None), "process", None)
+        mutate = read and callable(getattr(editor, "begin_update", None))
+        storage = callable(getattr(getattr(host, "plugin", None), "storage", None))
+        return cls(read, mutate, storage)
 
     @property
     def mode(self) -> str:
-        if {FEATURE_SNAPSHOT, FEATURE_TRANSACTION, FEATURE_VALUES} <= self.features:
+        if self.mutate:
             return MODE_AUTOMATIC
-        if self.snapshot or self.legacy_read:
-            return MODE_MANUAL
-        return MODE_UNAVAILABLE
+        return MODE_MANUAL if self.read else MODE_UNAVAILABLE
 
 
 @dataclass(frozen=True)
 class Workspace:
-    """Allowlisted values of the edited presets; revision is None for the legacy read API."""
-    revision: Optional[str]
+    """Allowlisted values of the edited presets."""
     names: Dict[str, str]
     values: Dict[str, Dict[str, str]]
 
@@ -297,31 +282,11 @@ def _allowed_values(raw: Any, preset_type: str) -> Dict[str, str]:
     return values
 
 
-def workspace_from_snapshot(snapshot: Any) -> Workspace:
-    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("revision"), str):
-        raise ValueError("OrcaSlicer вернул некорректный снимок пресетов.")
-
-    def section(name: str) -> Mapping:
-        value = snapshot.get(name)
-        return value if isinstance(value, Mapping) else {}
-
-    edited, selected, requested = section("edited"), section("selected"), section("requested_values")
-    names = {}
-    for preset_type in PRESET_TYPES:
-        summary = edited.get(preset_type)
-        name = summary.get("name") if isinstance(summary, Mapping) else None
-        if not isinstance(name, str):
-            name = selected.get(preset_type)
-        names[preset_type] = _short(name, MAX_NAME_CHARS) if isinstance(name, str) else ""
-    values = {t: _allowed_values(requested.get(t), t) for t in PRESET_TYPES}
-    return Workspace(snapshot["revision"], names, values)
-
-
 def workspace_from_bundle(bundle: Any) -> Workspace:
-    """Read the edited presets through the legacy read-only preset_bundle() bridge."""
+    """Read the edited presets through the read-only preset_bundle() bridge (GUI thread only)."""
     names, values = {}, {}
     for preset_type in PRESET_TYPES:
-        preset = getattr(bundle, LEGACY_COLLECTIONS[preset_type]).edited_preset()
+        preset = getattr(bundle, BUNDLE_COLLECTIONS[preset_type]).edited_preset()
         names[preset_type] = _short(preset.name, MAX_NAME_CHARS)
         raw = {}
         for key in SNAPSHOT_KEYS[preset_type]:
@@ -329,14 +294,11 @@ def workspace_from_bundle(bundle: Any) -> Workspace:
             if value is not None:
                 raw[key] = str(value)
         values[preset_type] = _allowed_values(raw, preset_type)
-    return Workspace(None, names, values)
+    return Workspace(names, values)
 
 
 def capture_workspace(host: Any, features: HostFeatures) -> Workspace:
-    if features.snapshot:
-        keys = {t: list(SNAPSHOT_KEYS[t]) for t in PRESET_TYPES}
-        return workspace_from_snapshot(host.v1.presets.snapshot(config_keys=keys))
-    if features.legacy_read:
+    if features.read:
         return workspace_from_bundle(host.preset_bundle())
     raise RuntimeError(MODE_TEXT[MODE_UNAVAILABLE])
 
@@ -447,7 +409,11 @@ class GeminiClient:
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise GeminiError(self._timeout_message()) from None
+            if isinstance(exc.reason, PermissionError):
+                raise GeminiError(self._permission_message()) from None
             raise GeminiError(self._redact(f"Не удалось подключиться к Gemini: {exc.reason}")) from None
+        except PermissionError:
+            raise GeminiError(self._permission_message()) from None
         except (OSError, http.client.HTTPException) as exc:
             raise GeminiError(self._redact(f"Ошибка сети при обращении к Gemini: {exc}")) from None
         if cancel.is_set():
@@ -456,6 +422,11 @@ class GeminiClient:
 
     def _redact(self, text: str) -> str:
         return redact(text, [self._api_key])
+
+    def _permission_message(self) -> str:
+        host = urllib.parse.urlsplit(self._base_url).hostname
+        return (f"OrcaSlicer заблокировал доступ плагина к {host}: разрешите его в окне «Плагины» "
+                "и повторите запрос.")
 
     def _timeout_message(self) -> str:
         return f"Gemini не ответил вовремя (лимит {int(self._timeout)} с)."
@@ -537,7 +508,7 @@ class Recommendation:
 
 @dataclass(frozen=True)
 class Analysis:
-    revision: Optional[str]
+    names: Dict[str, str]
     summary: str
     recommendations: Tuple[Recommendation, ...] = field(default_factory=tuple)
 
@@ -619,7 +590,7 @@ def parse_recommendations(text: str, workspace: Workspace, id_prefix: str = "r")
     recommendations = tuple(
         _parse_item(item, f"Рекомендация №{index}", workspace, seen, f"{id_prefix}-{index}")
         for index, item in enumerate(items, 1))
-    return Analysis(workspace.revision, summary.strip(), recommendations)
+    return Analysis(workspace.names, summary.strip(), recommendations)
 
 
 # --------------------------------------------------------------------------- #
@@ -633,16 +604,18 @@ def select_rows(recommendations: Sequence[Recommendation], selected_ids: Any) ->
     return [rec for rec in recommendations if rec.row_id in wanted]
 
 
-def build_commit_request(revision: str, recommendations: Sequence[Recommendation], selected_ids: Any) -> dict:
-    """One set_values operation per preset type, containing only the checked rows."""
-    values: Dict[str, Dict[str, str]] = {t: {} for t in PRESET_TYPES}
-    for rec in select_rows(recommendations, selected_ids):
-        values[rec.preset_type][rec.key] = rec.proposed_value
-    operations = [{"op": "set_values", "preset_type": t, "scope": {"edited": True}, "values": v}
-                  for t, v in values.items() if v]
-    if not operations:
-        raise ValueError("Отметьте хотя бы одну рекомендацию.")
-    return {"expected_revision": revision, "interaction": "require_user_confirmation", "operations": operations}
+def stale_rows(workspace: Workspace, rows: Sequence[Recommendation]) -> List[Recommendation]:
+    """Rows whose current preset value no longer matches the value the analysis was based on."""
+    return [r for r in rows if workspace.values.get(r.preset_type, {}).get(r.key) != r.old_value]
+
+
+def filament_slot_for(bundle: Any) -> Optional[int]:
+    """First 1-based slot that holds the edited filament preset, or None if no slot uses it."""
+    edited = bundle.filaments.edited_preset().name
+    for index, name in enumerate(bundle.current_filament_preset_names(), 1):
+        if name == edited:
+            return index
+    return None
 
 
 @dataclass(frozen=True)
@@ -652,43 +625,42 @@ class ApplyOutcome:
     discard_rows: bool
 
 
-def _host_details(result: Mapping) -> str:
-    diagnostics = result.get("diagnostics")
-    messages = [_short(d["message"], 200) for d in (diagnostics if isinstance(diagnostics, list) else [])[:5]
-                if isinstance(d, dict) and isinstance(d.get("message"), str)]
-    if not messages and isinstance(result.get("message"), str) and result["message"]:
-        messages.append(_short(result["message"], 200))
-    return "; ".join(messages)
+def confirmation_text(category: str, preset_name: str, rows: Sequence[Recommendation]) -> str:
+    lines = [f"Применить изменения к пресету «{CATEGORY_LABELS[category]}: {preset_name}»?", ""]
+    lines += [f"{r.key}: {r.old_value} → {r.proposed_value}" for r in rows]
+    lines += ["", "Пресет станет изменённым, но не будет сохранён автоматически."]
+    return "\n".join(lines)
 
 
-def describe_commit_result(result: Any) -> ApplyOutcome:
-    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-        return ApplyOutcome("error", "OrcaSlicer вернул некорректный ответ на запрос изменения пресетов.", False)
-    status = result["status"]
-    details = _host_details(result)
-    suffix = f" Подробности: {details}" if details else ""
-    if status == "applied":
-        affected = result.get("affected")
-        count = len(affected) if isinstance(affected, list) else 0
-        if count == 0:
-            return ApplyOutcome("info", "Изменений не потребовалось: значения уже совпадают.", True)
-        return ApplyOutcome("ok", f"Применено изменений: {count}. Пресеты помечены как изменённые — проверьте "
-                                  "и сохраните их. Для новых рекомендаций запустите анализ снова.", True)
-    if status == "cancelled":
+def apply_category(host: Any, category: str, slot: Optional[int], rows: Sequence[Recommendation],
+                   expected_name: str) -> ApplyOutcome:
+    """Confirm and apply rows of one category as one transaction. Must not run on the GUI thread."""
+    answer = host.ui.message(confirmation_text(category, expected_name, rows), title=PLUGIN_NAME,
+                             buttons="yes_no", icon="question")
+    if answer != "yes":
         return ApplyOutcome("info", "Применение отменено, пресеты не изменены.", False)
-    if status == "conflict":
-        return ApplyOutcome("error", "Пресеты изменились после анализа. Рекомендации сброшены — "
-                                     "запустите анализ заново.", True)
-    if status == "invalid":
+    editor = getattr(host.preset, PRESET_EDITORS[category])
+    try:
+        transaction = editor.begin_update(slot) if category == "filament" else editor.begin_update("")
+    except ValueError as exc:
+        return ApplyOutcome("error", f"OrcaSlicer не может выбрать пресет: {_short(exc, 200)}", False)
+    except RuntimeError:
+        return ApplyOutcome("info", "Применение отменено, пресеты не изменены.", False)
+    if transaction.target_name != expected_name:
+        return ApplyOutcome("error", "Пресет сменился после анализа, ничего не применено — запустите анализ "
+                                     "заново.", True)
+    try:
+        for rec in rows:
+            transaction.set(rec.key, rec.proposed_value)
+        result = transaction.commit()
+    except ValueError as exc:
         return ApplyOutcome("error", "OrcaSlicer отклонил изменения, ничего не применено. Снимите отметку с "
-                                     "проблемных строк и повторите." + suffix, False)
-    if status == "unsupported":
-        return ApplyOutcome("error", "OrcaSlicer сейчас не может применить изменения (например, идёт нарезка "
-                                     "или закрытие программы). Повторите позже." + suffix, False)
-    if status == "error":
-        return ApplyOutcome("error", "Ошибка при применении, изменения отменены." + suffix, False)
-    return ApplyOutcome("error", f"Неожиданный ответ OrcaSlicer ({_short(status, 40)}), ничего не применено."
-                        + suffix, False)
+                                     f"проблемных строк и повторите. Подробности: {_short(exc, 200)}", False)
+    except RuntimeError:
+        return ApplyOutcome("error", "Пресет изменился во время применения, ничего не применено — запустите "
+                                     "анализ заново.", True)
+    return ApplyOutcome("ok", f"Применено изменений: {len(result.keys)} ({CATEGORY_LABELS[category]}). Пресет "
+                              "помечен как изменённый — проверьте и сохраните его.", True)
 
 
 def format_manual_instructions(rows: Sequence[Recommendation]) -> str:
@@ -812,11 +784,11 @@ class AiAssistApp:
         return stopped
 
     def _resolve_storage(self) -> Optional[str]:
-        # plugin_storage() only works inside a GUI-thread plugin callback, so it is resolved once here.
+        # plugin.storage() only works inside a plugin callback, so it is resolved once here.
         if not self._features.storage:
             return None
         try:
-            path = self._host.v1.plugin_storage()
+            path = self._host.plugin.storage()
             if not isinstance(path, str) or not os.path.isabs(path):
                 return None
             os.makedirs(path, exist_ok=True)
@@ -836,8 +808,8 @@ class AiAssistApp:
         }.get(kind)
         if handler is None:
             return
-        if self._applying and kind not in ("init", "cancel"):
-            self._status("error", "Дождитесь завершения применения изменений в окне подтверждения.")
+        if self._applying and kind != "init":
+            self._status("error", "Дождитесь завершения применения изменений в окне OrcaSlicer.")
             return
         handler(message)
 
@@ -932,31 +904,48 @@ class AiAssistApp:
         if self._tasks.busy:
             return self._status("error", "Дождитесь завершения текущего запроса к Gemini.")
         rows = select_rows(analysis.recommendations, message.get("selected"))
-        if not rows:
-            return self._status("error", "Отметьте хотя бы одну рекомендацию.")
-        if self._features.mode != MODE_AUTOMATIC or analysis.revision is None:
-            self._status("info", "Перенесите значения в пресеты вручную: OrcaSlicer не поддерживает "
-                                 "применение изменений плагинами.")
+        if self._features.mode != MODE_AUTOMATIC:
+            if not rows:
+                return self._status("error", "Отметьте хотя бы одну рекомендацию.")
+            self._status("info", "Перенесите значения в пресеты вручную: эта версия OrcaSlicer не позволяет "
+                                 "плагинам менять пресеты.")
             return self._post({"type": "instructions", "text": format_manual_instructions(rows)})
-        request = build_commit_request(analysis.revision, analysis.recommendations, message.get("selected"))
-        self._applying = True
+        category = message.get("category")
+        if not isinstance(category, str) or category not in PRESET_TYPES:
+            return self._status("error", "Не указана категория пресета для применения.")
+        rows = [r for r in rows if r.preset_type == category]
+        if not rows:
+            return self._status("error", "Отметьте хотя бы одну рекомендацию в этой категории.")
         try:
-            result = self._host.v1.presets.commit(request)
+            bundle = self._host.preset_bundle()
+            current = workspace_from_bundle(bundle)
+            slot = filament_slot_for(bundle) if category == "filament" else None
         except Exception as exc:
-            result = {"status": "error", "message": _short(exc, 200)}
-        finally:
-            self._applying = False
-        if not self._loaded:
-            return
-        outcome = describe_commit_result(result)
-        if outcome.discard_rows:
-            self._analysis = None
-            self._post({"type": "analysis", "summary": analysis.summary, "rows": []})
-        self._status(outcome.level, outcome.message)
+            return self._status("error", f"Не удалось прочитать пресеты: {_short(exc, 200)}")
+        name = current.names[category]
+        if name != analysis.names.get(category):
+            return self._status("error", f"Пресет «{CATEGORY_LABELS[category]}» сменился после анализа — "
+                                         "запустите анализ заново.")
+        stale = stale_rows(current, rows)
+        if stale:
+            keys = ", ".join(r.key for r in stale)
+            return self._status("error", f"Значения изменились после анализа ({_short(keys, 200)}) — снимите "
+                                         "отметку или запустите анализ заново.")
+        if category == "filament" and slot is None:
+            return self._status("error", "Редактируемый пресет пластика не выбран ни в одном слоте — выберите "
+                                         "его в слоте филамента и повторите.")
+        self._applying = True
+        self._status("info", "Подтвердите изменения в окне OrcaSlicer…")
+        self._post_state(busy=True)
+        host = self._host
+        self._tasks.submit("apply", lambda _cancel: (category, apply_category(host, category, slot, rows, name)))
 
     # worker results (worker thread, under the task controller lock) ----------
-    def _on_task_done(self, _generation: int, _kind: str, ok: bool, value: Any) -> None:
-        if ok:
+    def _on_task_done(self, _generation: int, kind: str, ok: bool, value: Any) -> None:
+        if kind == "apply":
+            self._applying = False
+            self._on_applied(ok, value)
+        elif ok:
             self._analysis = value
             self._post_analysis(value)
             count = len(value.recommendations)
@@ -967,6 +956,22 @@ class AiAssistApp:
         else:
             self._status("error", f"Непредвиденная ошибка: {type(value).__name__}.")
         self._post_state()
+
+    def _on_applied(self, ok: bool, value: Any) -> None:
+        if not ok:
+            if isinstance(value, PermissionError):
+                self._status("error", "OrcaSlicer заблокировал действие плагина: проверьте разрешения в окне "
+                                      "«Плагины» и повторите.")
+            else:
+                self._status("error", f"Ошибка при применении, ничего не применено: {type(value).__name__}.")
+            return
+        category, outcome = value
+        analysis = self._analysis
+        if outcome.discard_rows and analysis is not None:
+            kept = tuple(r for r in analysis.recommendations if r.preset_type != category)
+            self._analysis = replace(analysis, recommendations=kept)
+            self._post_analysis(self._analysis)
+        self._status(outcome.level, outcome.message)
 
     # messages to the page -----------------------------------------------------
     def _status(self, level: str, text: str) -> None:
@@ -986,12 +991,12 @@ class AiAssistApp:
             "base_url": self._config.base_url,
             "consent": self._config.preset_data_consent,
             "busy": self._tasks.busy if busy is None else busy,
-            "apply_label": "Применить выбранные" if mode == MODE_AUTOMATIC else "Скопировать инструкции",
         })
 
     def _post_analysis(self, analysis: Analysis) -> None:
         self._post({"type": "analysis", "summary": analysis.summary, "rows": [{
-            "id": r.row_id, "category": CATEGORY_LABELS[r.preset_type], "key": r.key, "old": r.old_value,
+            "id": r.row_id, "preset_type": r.preset_type, "category": CATEGORY_LABELS[r.preset_type],
+            "key": r.key, "old": r.old_value,
             "proposed": r.proposed_value, "reason": r.reason,
             "confidence": CONFIDENCE_LABELS.get(r.confidence, ""),
         } for r in analysis.recommendations]})
@@ -1072,7 +1077,7 @@ ul { margin: 4px 0; padding-left: 20px; }
   <table><thead><tr><th><input id="all" type="checkbox" title="Выбрать все"></th><th>Категория</th>
     <th>Параметр</th><th>Текущее</th><th>Предлагаемое</th><th>Причина</th><th>Уверенность</th></tr></thead>
     <tbody id="rows"></tbody></table>
-  <button id="apply" class="primary" disabled>Применить выбранные</button>
+  <div id="apply-buttons"></div>
   <div id="instructions-box" hidden>
     <label for="instructions">Инструкции для ручного переноса</label>
     <textarea id="instructions" readonly rows="8"></textarea>
@@ -1084,12 +1089,30 @@ ul { margin: 4px 0; padding-left: 20px; }
   var state = {};
   function $(id) { return document.getElementById(id); }
   function send(type, extra) { var m = extra || {}; m.type = type; window.orca.postMessage(m); }
-  function checked() {
-    return Array.prototype.map.call(document.querySelectorAll('input.row:checked'),
-      function (c) { return c.getAttribute('data-id'); });
+  var LABELS = { print: 'Процесс', filament: 'Пластик', printer: 'Принтер' };
+  function checked(category) {
+    return Array.prototype.filter.call(document.querySelectorAll('input.row:checked'), function (c) {
+      return !category || c.getAttribute('data-type') === category;
+    }).map(function (c) { return c.getAttribute('data-id'); });
   }
   function setStatus(level, text) { var s = $('status'); s.textContent = text || ''; s.className = 'status ' + (level || ''); }
-  function updateApply() { $('apply').disabled = !!state.busy || checked().length === 0; }
+  function applyButton(text, onClick, disabled) {
+    var b = document.createElement('button'); b.className = 'primary'; b.textContent = text;
+    b.disabled = disabled; b.addEventListener('click', onClick); $('apply-buttons').appendChild(b);
+  }
+  function updateApply() {
+    $('apply-buttons').textContent = '';
+    if (state.mode !== 'automatic') {
+      applyButton('Скопировать инструкции', function () { send('apply', { selected: checked() }); },
+                  !!state.busy || checked().length === 0);
+      return;
+    }
+    ['print', 'filament', 'printer'].forEach(function (t) {
+      var ids = checked(t);
+      if (ids.length) applyButton('Применить: ' + LABELS[t] + ' (' + ids.length + ')',
+                                  function () { send('apply', { category: t, selected: ids }); }, !!state.busy);
+    });
+  }
   function cell(tr, text, cls) { var td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); }
 
   function renderState(s) {
@@ -1102,7 +1125,6 @@ ul { margin: 4px 0; padding-left: 20px; }
     var blocked = s.busy || s.mode === 'unavailable';
     $('analyze').disabled = blocked; $('diagnose').disabled = blocked;
     $('cancel').hidden = !s.busy;
-    $('apply').textContent = s.apply_label;
     updateApply();
   }
   function renderAnalysis(d) {
@@ -1110,6 +1132,7 @@ ul { margin: 4px 0; padding-left: 20px; }
     (d.rows || []).forEach(function (r) {
       var tr = document.createElement('tr'), td = document.createElement('td'), box = document.createElement('input');
       box.type = 'checkbox'; box.className = 'row'; box.setAttribute('data-id', r.id);
+      box.setAttribute('data-type', r.preset_type);
       box.addEventListener('change', updateApply);
       td.appendChild(box); tr.appendChild(td);
       cell(tr, r.category); cell(tr, r.key, 'mono'); cell(tr, r.old, 'mono'); cell(tr, r.proposed, 'mono');
@@ -1142,7 +1165,6 @@ ul { margin: 4px 0; padding-left: 20px; }
   $('analyze').addEventListener('click', function () { send('analyze'); });
   $('diagnose').addEventListener('click', function () { send('diagnose', { problem: $('problem').value }); });
   $('cancel').addEventListener('click', function () { send('cancel'); });
-  $('apply').addEventListener('click', function () { send('apply', { selected: checked() }); });
   $('all').addEventListener('change', function () {
     var on = $('all').checked;
     Array.prototype.forEach.call(document.querySelectorAll('input.row'), function (c) { c.checked = on; });
@@ -1198,4 +1220,6 @@ if orca is not None:
     @orca.plugin
     class AiAssistPlugin(orca.base):
         def register_capabilities(self):
+            if callable(getattr(orca, "request_permissions", None)):
+                orca.request_permissions(network=[DEFAULT_BASE_URL], threading=True)
             orca.register_capability(AiAssistPage)

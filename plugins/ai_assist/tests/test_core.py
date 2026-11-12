@@ -26,9 +26,8 @@ ALL_FEATURES = ["plugin_storage.v1", "preset_snapshot.v1", "preset_transaction.v
                 "preset_select.v1", "preset_values.v1"]
 
 
-def make_workspace(revision="rev-1"):
+def make_workspace():
     return ai.Workspace(
-        revision,
         {"print": "0.20mm Standard", "filament": "Generic PLA", "printer": "MK4 0.4"},
         {"print": {"layer_height": "0.2", "wall_loops": "2", "elefant_foot_compensation": "0"},
          "filament": {"nozzle_temperature": "215", "filament_flow_ratio": "0.98"},
@@ -47,48 +46,41 @@ def response(*items, summary="Итог"):
 
 
 class FeatureDiscoveryTests(unittest.TestCase):
-    def host(self, api_info=None, legacy=True):
+    def host(self, read=True, mutate=True, storage=True, v1=False):
         host = SimpleNamespace()
-        if api_info is not None:
-            host.api_info = api_info
-        if legacy:
+        if read:
             host.preset_bundle = lambda: None
+        if mutate:
+            editor = SimpleNamespace(begin_update=lambda *a: None)
+            host.preset = SimpleNamespace(process=editor, filament=editor, printer=editor)
+        if storage:
+            host.plugin = SimpleNamespace(storage=lambda: "/tmp")
+        if v1:
+            host.api_info = lambda: {"features": ALL_FEATURES}
+            host.v1 = SimpleNamespace(plugin_storage=lambda: "/tmp")
         return host
 
-    def test_full_host_is_automatic(self):
-        features = ai.HostFeatures.discover(self.host(lambda: {"api_version": "1.0", "features": ALL_FEATURES}))
+    def test_upstream_host_is_automatic(self):
+        features = ai.HostFeatures.discover(self.host())
         self.assertEqual(features.mode, ai.MODE_AUTOMATIC)
         self.assertTrue(features.storage)
 
-    def test_newer_host_with_extra_features_stays_automatic(self):
-        info = {"api_version": "7.3", "host_version": "9.0", "features": ALL_FEATURES + ["future.v2"]}
-        self.assertEqual(ai.HostFeatures.discover(self.host(lambda: info)).mode, ai.MODE_AUTOMATIC)
-
-    def test_missing_api_info_is_manual(self):
-        features = ai.HostFeatures.discover(self.host())
+    def test_read_only_host_is_manual(self):
+        features = ai.HostFeatures.discover(self.host(mutate=False, storage=False))
         self.assertEqual(features.mode, ai.MODE_MANUAL)
         self.assertFalse(features.storage)
 
-    def test_raising_api_info_is_manual(self):
-        def boom():
-            raise RuntimeError("no")
-        self.assertEqual(ai.HostFeatures.discover(self.host(boom)).mode, ai.MODE_MANUAL)
+    def test_mutation_without_reader_is_unavailable(self):
+        self.assertEqual(ai.HostFeatures.discover(self.host(read=False)).mode, ai.MODE_UNAVAILABLE)
 
-    def test_malformed_api_info_is_manual(self):
-        self.assertEqual(ai.HostFeatures.discover(self.host(lambda: "1.0")).mode, ai.MODE_MANUAL)
-        self.assertEqual(ai.HostFeatures.discover(self.host(lambda: {"features": "all"})).mode, ai.MODE_MANUAL)
+    def test_fork_v1_api_is_ignored(self):
+        features = ai.HostFeatures.discover(self.host(read=False, mutate=False, storage=False, v1=True))
+        self.assertEqual(features.mode, ai.MODE_UNAVAILABLE)
+        self.assertFalse(features.storage)
 
-    def test_feature_subset_is_manual(self):
-        for missing in ("preset_snapshot.v1", "preset_transaction.v1", "preset_values.v1"):
-            features = [f for f in ALL_FEATURES if f != missing]
-            with self.subTest(missing=missing):
-                found = ai.HostFeatures.discover(self.host(lambda: {"features": features}, legacy=False))
-                expected = ai.MODE_UNAVAILABLE if missing == "preset_snapshot.v1" else ai.MODE_MANUAL
-                self.assertEqual(found.mode, expected)
-
-    def test_no_reader_is_unavailable(self):
-        self.assertEqual(ai.HostFeatures.discover(self.host(legacy=False)).mode, ai.MODE_UNAVAILABLE)
+    def test_no_host_is_unavailable(self):
         self.assertEqual(ai.HostFeatures.discover(None).mode, ai.MODE_UNAVAILABLE)
+        self.assertEqual(ai.HostFeatures.discover(SimpleNamespace()).mode, ai.MODE_UNAVAILABLE)
 
 
 class ConfigTests(unittest.TestCase):
@@ -171,23 +163,22 @@ class PayloadTests(unittest.TestCase):
                     "cloud_user_id", "post_process_path", "Gemini_API_KEY"):
             self.assertTrue(ai.is_sensitive_key(key), key)
 
-    def snapshot(self):
-        return {
-            "revision": "abc",
-            "edited": {"print": {"name": "Proc"}, "filament": {"name": "PLA"}, "printer": {}},
-            "selected": {"printer": "Printer A"},
-            "requested_values": {
-                "print": {"layer_height": "0.2", "post_process": "/home/user/script.sh", "wall_loops": 3},
-                "filament": {"nozzle_temperature": "215"},
-                "printer": {"nozzle_diameter": "0.4", "printhost_apikey": "SECRET", "print_host": "10.0.0.2"},
-            },
-        }
+    def bundle(self):
+        def preset(name, values):
+            return SimpleNamespace(name=name, config_value=values.get)
 
-    def test_snapshot_payload_contains_only_allowlisted_strings(self):
-        workspace = ai.workspace_from_snapshot(self.snapshot())
+        return SimpleNamespace(
+            prints=SimpleNamespace(edited_preset=lambda: preset(
+                "Proc", {"layer_height": "0.2", "post_process": "/home/user/script.sh", "wall_loops": 3})),
+            filaments=SimpleNamespace(edited_preset=lambda: preset("PLA", {"nozzle_temperature": "215"})),
+            printers=SimpleNamespace(edited_preset=lambda: preset(
+                "Printer A", {"nozzle_diameter": "0.4", "printhost_apikey": "SECRET", "print_host": "10.0.0.2"})))
+
+    def test_bundle_payload_contains_only_allowlisted_strings(self):
+        workspace = ai.workspace_from_bundle(self.bundle())
         payload = ai.build_provider_payload(workspace, "углы задираются")
         self.assertEqual(payload["presets"], {"print": "Proc", "filament": "PLA", "printer": "Printer A"})
-        self.assertEqual(payload["settings"], {"print": {"layer_height": "0.2"},
+        self.assertEqual(payload["settings"], {"print": {"layer_height": "0.2", "wall_loops": "3"},
                                                "filament": {"nozzle_temperature": "215"},
                                                "printer": {"nozzle_diameter": "0.4"}})
         self.assertEqual(payload["problem"], "углы задираются")
@@ -196,7 +187,7 @@ class PayloadTests(unittest.TestCase):
             self.assertNotIn(secret, dumped)
 
     def test_payload_filters_tampered_workspace(self):
-        workspace = ai.Workspace("r", {"print": "P"}, {"printer": {"printhost_apikey": "SECRET", "z_hop": "0.4"}})
+        workspace = ai.Workspace({"print": "P"}, {"printer": {"printhost_apikey": "SECRET", "z_hop": "0.4"}})
         payload = ai.build_provider_payload(workspace)
         self.assertEqual(payload["settings"]["printer"], {"z_hop": "0.4"})
         self.assertNotIn("problem", payload)
@@ -208,36 +199,10 @@ class PayloadTests(unittest.TestCase):
         self.assertIn(ai.PROBLEM_TASK, prompt)
         self.assertIn('"stringing"', prompt)
 
-    def test_invalid_snapshot_rejected(self):
-        for bad in (None, {}, {"revision": 5}):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                ai.workspace_from_snapshot(bad)
-
-    def test_capture_uses_snapshot_with_allowlisted_keys(self):
-        calls = []
-
-        def snapshot(config_keys):
-            calls.append(config_keys)
-            return self.snapshot()
-
-        host = SimpleNamespace(v1=SimpleNamespace(presets=SimpleNamespace(snapshot=snapshot)))
-        features = ai.HostFeatures(frozenset(ALL_FEATURES))
-        self.assertEqual(ai.capture_workspace(host, features).revision, "abc")
-        self.assertEqual(calls, [{t: list(ai.SNAPSHOT_KEYS[t]) for t in ai.PRESET_TYPES}])
-
-    def test_legacy_bundle_read(self):
-        def preset(name, values):
-            return SimpleNamespace(name=name, config_value=values.get)
-
-        bundle = SimpleNamespace(
-            prints=SimpleNamespace(edited_preset=lambda: preset("Proc", {"layer_height": "0.2"})),
-            filaments=SimpleNamespace(edited_preset=lambda: preset("PLA", {"nozzle_temperature": "215"})),
-            printers=SimpleNamespace(edited_preset=lambda: preset("Prn", {"nozzle_diameter": "0.4",
-                                                                          "printhost_apikey": "SECRET"})))
-        host = SimpleNamespace(preset_bundle=lambda: bundle)
-        workspace = ai.capture_workspace(host, ai.HostFeatures(frozenset(), legacy_read=True))
-        self.assertIsNone(workspace.revision)
-        self.assertEqual(workspace.names, {"print": "Proc", "filament": "PLA", "printer": "Prn"})
+    def test_capture_reads_bundle(self):
+        host = SimpleNamespace(preset_bundle=self.bundle)
+        workspace = ai.capture_workspace(host, ai.HostFeatures(read=True))
+        self.assertEqual(workspace.names, {"print": "Proc", "filament": "PLA", "printer": "Printer A"})
         self.assertEqual(workspace.values["printer"], {"nozzle_diameter": "0.4"})
 
     def test_capture_without_reader_fails(self):
@@ -258,7 +223,7 @@ class ParserTests(unittest.TestCase):
     def test_valid_response_joins_old_value_from_snapshot(self):
         analysis = self.parse(response(rec_json(), rec_json(preset_type="filament", key="nozzle_temperature",
                                                             proposed_value="210", reason="", confidence=None)))
-        self.assertEqual(analysis.revision, "rev-1")
+        self.assertEqual(analysis.names, make_workspace().names)
         self.assertEqual(analysis.summary, "Итог")
         first, second = analysis.recommendations
         self.assertEqual((first.row_id, first.old_value, first.proposed_value, first.confidence),
@@ -342,75 +307,135 @@ def three_recommendations():
             ai.Recommendation("r1-3", "filament", "nozzle_temperature", "215", "210", ""))
 
 
-class CommitRequestTests(unittest.TestCase):
-    def test_single_checked_row(self):
-        request = ai.build_commit_request("rev-1", three_recommendations(), ["r1-2"])
-        self.assertEqual(request, {
-            "expected_revision": "rev-1", "interaction": "require_user_confirmation",
-            "operations": [{"op": "set_values", "preset_type": "print", "scope": {"edited": True},
-                            "values": {"wall_loops": "3"}}]})
+class StaleRowsTests(unittest.TestCase):
+    def test_changed_and_missing_values_are_stale(self):
+        now = ai.Workspace({}, {"print": {"layer_height": "0.2", "wall_loops": "4"}, "filament": {}})
+        stale = ai.stale_rows(now, three_recommendations())
+        self.assertEqual([r.row_id for r in stale], ["r1-2", "r1-3"])
 
-    def test_one_operation_per_preset_type(self):
-        request = ai.build_commit_request("rev-1", three_recommendations(), ["r1-3", "r1-1", "r1-2"])
-        self.assertEqual([(op["preset_type"], op["values"]) for op in request["operations"]],
-                         [("print", {"layer_height": "0.16", "wall_loops": "3"}),
-                          ("filament", {"nozzle_temperature": "210"})])
-
-    def test_unknown_duplicate_and_foreign_ids_ignored(self):
-        request = ai.build_commit_request("rev-1", three_recommendations(),
-                                          ["r1-1", "r1-1", "r9-9", 7, {"id": "r1-2"}, None])
-        self.assertEqual(request["operations"][0]["values"], {"layer_height": "0.16"})
-        self.assertEqual(len(request["operations"]), 1)
-
-    def test_empty_selection_rejected(self):
-        for selected in ([], ["nope"], "r1-1", None, {"r1-1": True}):
-            with self.subTest(selected=selected), self.assertRaises(ValueError):
-                ai.build_commit_request("rev-1", three_recommendations(), selected)
+    def test_unchanged_values_are_fresh(self):
+        self.assertEqual(ai.stale_rows(make_workspace(), three_recommendations()[:1]), [])
 
 
-class CommitOutcomeTests(unittest.TestCase):
-    def test_applied(self):
-        outcome = ai.describe_commit_result({"status": "applied", "revision": "r2", "diagnostics": [],
-                                             "affected": [{"key": "a"}, {"key": "b"}]})
-        self.assertEqual(outcome.level, "ok")
+class FilamentSlotTests(unittest.TestCase):
+    def bundle(self, slots, edited):
+        return SimpleNamespace(current_filament_preset_names=lambda: list(slots),
+                               filaments=SimpleNamespace(edited_preset=lambda: SimpleNamespace(name=edited)))
+
+    def test_first_assigned_slot_is_one_based(self):
+        self.assertEqual(ai.filament_slot_for(self.bundle(["A", "B", "B"], "B")), 2)
+
+    def test_unassigned_edited_preset(self):
+        self.assertIsNone(ai.filament_slot_for(self.bundle(["A", "B"], "C")))
+        self.assertIsNone(ai.filament_slot_for(self.bundle([], "A")))
+
+
+class FakeTransaction:
+    def __init__(self, host, target_name):
+        self.host, self.target_name, self.staged = host, target_name, []
+
+    def set(self, key, value):
+        self.staged.append((key, value))
+
+    def commit(self):
+        if self.host.commit_error:
+            raise self.host.commit_error
+        self.host.commits.append(list(self.staged))
+        return SimpleNamespace(keys=[k for k, _ in self.staged], target_name=self.target_name, dirty=True)
+
+
+class ApplyHost:
+    def __init__(self, answer="yes", target_name="0.20mm Standard"):
+        self.answer, self.target_name = answer, target_name
+        self.dialogs, self.begins, self.commits = [], [], []
+        self.begin_error = self.commit_error = None
+        editor = lambda category: SimpleNamespace(begin_update=lambda *a: self.begin(category, a))
+        self.preset = SimpleNamespace(process=editor("process"), filament=editor("filament"),
+                                      printer=editor("printer"))
+        self.ui = SimpleNamespace(message=self.message)
+
+    def message(self, text, title="OrcaSlicer", buttons="ok", icon="info"):
+        self.dialogs.append((text, title, buttons, icon))
+        return self.answer
+
+    def begin(self, category, args):
+        self.begins.append((category, args))
+        if self.begin_error:
+            raise self.begin_error
+        return FakeTransaction(self, self.target_name)
+
+
+class ApplyCategoryTests(unittest.TestCase):
+    rows = three_recommendations()[:2]
+
+    def apply(self, host, category="print", slot=None, rows=None, name="0.20mm Standard"):
+        return ai.apply_category(host, category, slot, rows or self.rows, name)
+
+    def test_confirmed_print_rows_committed_in_one_transaction(self):
+        host = ApplyHost()
+        outcome = self.apply(host)
+        self.assertEqual(host.begins, [("process", ("",))])
+        self.assertEqual(host.commits, [[("layer_height", "0.16"), ("wall_loops", "3")]])
+        self.assertEqual((outcome.level, outcome.discard_rows), ("ok", True))
         self.assertIn("2", outcome.message)
-        self.assertTrue(outcome.discard_rows)
+        text, _title, buttons, _icon = host.dialogs[0]
+        self.assertEqual(buttons, "yes_no")
+        self.assertIn("layer_height: 0.2 → 0.16", text)
+        self.assertIn("Процесс", text)
 
-    def test_applied_nothing_to_change(self):
-        outcome = ai.describe_commit_result({"status": "applied", "affected": [], "message": "Nothing to change"})
-        self.assertEqual(outcome.level, "info")
-        self.assertIn("не потребовалось", outcome.message)
+    def test_filament_targets_slot(self):
+        host = ApplyHost(target_name="Generic PLA")
+        rows = three_recommendations()[2:]
+        self.assertEqual(self.apply(host, "filament", 2, rows, "Generic PLA").level, "ok")
+        self.assertEqual(host.begins, [("filament", (2,))])
 
-    def test_cancelled_keeps_rows(self):
-        outcome = ai.describe_commit_result({"status": "cancelled", "diagnostics": []})
+    def test_printer_uses_printer_editor(self):
+        host = ApplyHost(target_name="MK4")
+        self.apply(host, "printer", None, [ai.Recommendation("x", "printer", "z_hop", "0.4", "0.2", "")], "MK4")
+        self.assertEqual(host.begins, [("printer", ("",))])
+
+    def test_declined_confirmation_applies_nothing(self):
+        host = ApplyHost(answer="no")
+        outcome = self.apply(host)
+        self.assertEqual(host.begins, [])
         self.assertEqual((outcome.level, outcome.discard_rows), ("info", False))
         self.assertIn("отменено", outcome.message)
 
-    def test_conflict_discards_rows(self):
-        outcome = ai.describe_commit_result({"status": "conflict", "revision": "r9", "diagnostics": []})
+    def test_cancelled_unsaved_prompt(self):
+        host = ApplyHost()
+        host.begin_error = RuntimeError("Switching ... was cancelled")
+        outcome = self.apply(host)
+        self.assertEqual((outcome.level, outcome.discard_rows), ("info", False))
+        self.assertIn("отменено", outcome.message)
+
+    def test_unavailable_target(self):
+        host = ApplyHost()
+        host.begin_error = ValueError("Filament slot 3 is out of range")
+        outcome = self.apply(host)
+        self.assertEqual((outcome.level, outcome.discard_rows), ("error", False))
+        self.assertIn("slot 3", outcome.message)
+
+    def test_target_mismatch_does_not_commit(self):
+        host = ApplyHost(target_name="Other")
+        outcome = self.apply(host)
+        self.assertEqual(host.commits, [])
         self.assertEqual((outcome.level, outcome.discard_rows), ("error", True))
         self.assertIn("заново", outcome.message)
 
-    def test_invalid_lists_diagnostics(self):
-        outcome = ai.describe_commit_result({"status": "invalid", "diagnostics": [
-            {"code": "invalid_value", "operation_index": 0, "field": "values",
-             "message": "Invalid value for 'layer_height'"}, "junk"]})
+    def test_commit_value_error_applies_nothing(self):
+        host = ApplyHost()
+        host.commit_error = ValueError("Invalid value for 'layer_height'")
+        outcome = self.apply(host)
         self.assertEqual((outcome.level, outcome.discard_rows), ("error", False))
-        self.assertIn("Invalid value for 'layer_height'", outcome.message)
+        self.assertIn("ничего не применено", outcome.message)
+        self.assertIn("layer_height", outcome.message)
 
-    def test_unsupported_and_error_use_host_message(self):
-        for status in ("unsupported", "error"):
-            with self.subTest(status=status):
-                outcome = ai.describe_commit_result({"status": status, "diagnostics": "junk",
-                                                     "message": "host says no"})
-                self.assertEqual((outcome.level, outcome.discard_rows), ("error", False))
-                self.assertIn("host says no", outcome.message)
-
-    def test_unknown_and_malformed(self):
-        self.assertIn("not_found", ai.describe_commit_result({"status": "not_found"}).message)
-        for bad in (None, "applied", {"status": 1}):
-            with self.subTest(result=bad):
-                self.assertEqual(ai.describe_commit_result(bad).level, "error")
+    def test_commit_runtime_error_means_target_changed(self):
+        host = ApplyHost()
+        host.commit_error = RuntimeError("The edited process preset is \"B\"")
+        outcome = self.apply(host)
+        self.assertEqual((outcome.level, outcome.discard_rows), ("error", True))
+        self.assertIn("ничего не применено", outcome.message)
 
 
 class ManualInstructionsTests(unittest.TestCase):

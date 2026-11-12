@@ -1,7 +1,7 @@
 # AI Assist
 
-AI Assist теперь отдельный плагин: [plugins/ai_assist](../plugins/ai_assist/README.md).
-Он заменяет встроенное окно «Справка → AI Assist» и вкладку настроек AI Assist из версий до 2.5.0-ai.3.
+AI Assist — отдельный плагин для официального OrcaSlicer: [plugins/ai_assist](../plugins/ai_assist/README.md).
+Пресеты он меняет через встроенный API OrcaSlicer 2.5.0. Собственная сборка OrcaSlicer для него не нужна.
 
 Установка и общие сведения о плагинах — [PLUGINS_RU.md](PLUGINS_RU.md).
 

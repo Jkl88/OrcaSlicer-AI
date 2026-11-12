@@ -7,6 +7,8 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -15,8 +17,6 @@ from .test_gemini import FakeGemini, gemini_body
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "orca_ai_assist.py"
 API_KEY = "AIzaPLUGINKEY-987"
-ALL_FEATURES = ["plugin_storage.v1", "preset_snapshot.v1", "preset_transaction.v1",
-                "preset_select.v1", "preset_values.v1"]
 
 
 def load_plugin(name, fake_orca=None):
@@ -46,34 +46,80 @@ GOOD_ANSWER = model_answer(
     {"preset_type": "filament", "key": "nozzle_temperature", "proposed_value": "210", "reason": "нити",
      "confidence": "medium"})
 
+EDITORS = {"process": "print", "filament": "filament", "printer": "printer"}
+
+
+class FakeTransaction:
+    def __init__(self, host, category, target_name):
+        self.host, self.category, self.target_name, self.staged = host, category, target_name, []
+
+    def set(self, key, value):
+        self.host.off_ui("set")
+        self.staged.append((key, value))
+
+    def commit(self):
+        self.host.off_ui("commit")
+        if self.host.commit_error:
+            raise self.host.commit_error
+        self.host.commits.append((self.category, list(self.staged)))
+        self.host.values[self.category].update(self.staged)
+        return SimpleNamespace(keys=[k for k, _ in self.staged], target_name=self.target_name, dirty=True)
+
+
+class FakeEditor:
+    def __init__(self, host, category):
+        self.host, self.category = host, category
+
+    def begin_update(self, *args):
+        self.host.off_ui("begin_update")
+        self.host.begins.append((self.category, args))
+        if self.host.on_begin:
+            self.host.on_begin()
+        if self.host.begin_error:
+            raise self.host.begin_error
+        name = self.host.target_override or self.host.names[self.category]
+        return FakeTransaction(self.host, self.category, name)
+
 
 class FakeHost:
-    def __init__(self, storage, features=ALL_FEATURES):
-        self.storage = storage
-        self.features = features
-        self.commits = []
-        self.on_commit = None
-        self.commit_result = {"status": "applied", "revision": "rev-2", "diagnostics": [],
-                              "affected": [{"op": "set_values", "preset_type": "print", "key": "layer_height"}]}
-        self.v1 = SimpleNamespace(plugin_storage=lambda: self.storage,
-                                  presets=SimpleNamespace(snapshot=self.snapshot, commit=self.commit))
+    """Upstream OrcaSlicer 2.5.0 surface; mutations raise when called on the page (UI) thread."""
 
-    def api_info(self):
-        return {"api_version": "1.0", "host_version": "2.5.0", "features": list(self.features)}
+    def __init__(self, storage):
+        self.ui_thread = threading.current_thread()
+        self.storage_dir = storage
+        self.values = json.loads(json.dumps(PRESET_VALUES))
+        self.names = {t: f"{t} preset" for t in PRESET_VALUES}
+        self.slots = ["filament preset"]
+        self.answer = "yes"
+        self.dialogs, self.begins, self.commits, self.violations = [], [], [], []
+        self.on_begin = self.begin_error = self.commit_error = self.target_override = None
+        self.preset = SimpleNamespace(**{attr: FakeEditor(self, cat) for attr, cat in EDITORS.items()})
+        self.plugin = SimpleNamespace(storage=lambda: self.storage_dir)
+        self.ui = SimpleNamespace(message=self.message)
 
-    def snapshot(self, config_keys):
-        return {"revision": "rev-1", "selected": {}, "requested_values": PRESET_VALUES,
-                "edited": {t: {"name": f"{t} preset", "is_dirty": False} for t in PRESET_VALUES}}
+    def off_ui(self, call):
+        if threading.current_thread() is self.ui_thread:
+            self.violations.append(call)
+            raise AssertionError(f"{call} called on the UI thread")
 
-    def commit(self, request):
-        self.commits.append(request)
-        if self.on_commit:
-            self.on_commit(request)
-        return self.commit_result
+    def message(self, text, title="OrcaSlicer", buttons="ok", icon="info"):
+        self.dialogs.append((text, buttons))
+        return self.answer
+
+    def preset_bundle(self):
+        def preset(category):
+            return SimpleNamespace(name=self.names[category], config_value=self.values[category].get)
+
+        def collection(category):
+            return SimpleNamespace(edited_preset=lambda: preset(category))
+
+        return SimpleNamespace(prints=collection("print"), filaments=collection("filament"),
+                               printers=collection("printer"),
+                               current_filament_preset_names=lambda: list(self.slots))
 
 
 class LegacyHost:
-    """Official host: no api_info and no v1 namespace, only the read-only preset bridge."""
+    """Pre-2.5 official host: only the read-only preset bridge."""
 
     def preset_bundle(self):
         def collection(preset_type):
@@ -146,13 +192,23 @@ class AppTestCase(unittest.TestCase):
     def status(self):
         return self.page.last("status")
 
+    def apply(self, category, ids):
+        """Send apply and wait for the worker's final state."""
+        self.page.clear()
+        self.app.handle({"type": "apply", "category": category, "selected": ids})
+        self.page.wait_for(lambda m: m.get("type") == "state" and not m["busy"])
+        return self.status()
+
+    def ids(self, rows, category=None):
+        return [r["id"] for r in rows if category is None or r["preset_type"] == category]
+
 
 class AutomaticModeTests(AppTestCase):
     def test_initial_state(self):
         self.app.handle({"type": "init"})
         state = self.page.last("state")
         self.assertEqual(state["mode"], "automatic")
-        self.assertEqual(state["apply_label"], "Применить выбранные")
+        self.assertIn("по отдельности", state["mode_text"])
         self.assertTrue(state["storage_ok"])
         self.assertFalse(state["key_set"])
         self.assertFalse(state["consent"])
@@ -212,77 +268,166 @@ class AutomaticModeTests(AppTestCase):
         self.assertIn("слоновья нога", prompt)
         self.assertIn(ai.PROBLEM_TASK, prompt)
 
-    def test_apply_only_checked_rows(self):
+    def test_apply_runs_off_ui_thread_and_commits_one_category(self):
         self.configure()
         rows = self.analyze()["rows"]
-        self.app.handle({"type": "apply", "selected": [rows[1]["id"], "bogus", rows[1]["id"]]})
-        self.assertEqual(self.host.commits, [{
-            "expected_revision": "rev-1", "interaction": "require_user_confirmation",
-            "operations": [{"op": "set_values", "preset_type": "filament", "scope": {"edited": True},
-                            "values": {"nozzle_temperature": "210"}}]}])
-        self.assertEqual(self.status()["level"], "ok")
+        self.assertEqual([r["preset_type"] for r in rows], ["print", "filament"])
+        status = self.apply("print", self.ids(rows))
+        self.assertEqual(self.host.violations, [])
+        self.assertEqual(self.host.begins, [("print", ("",))])
+        self.assertEqual(self.host.commits, [("print", [("layer_height", "0.16")])])
+        self.assertEqual(status["level"], "ok")
+        text, buttons = self.host.dialogs[0]
+        self.assertEqual(buttons, "yes_no")
+        self.assertIn("layer_height: 0.2 → 0.16", text)
+        self.assertNotIn("nozzle_temperature", text)
+
+    def test_successful_apply_removes_only_that_category_rows(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.apply("print", self.ids(rows))
+        remaining = self.page.last("analysis")["rows"]
+        self.assertEqual([r["preset_type"] for r in remaining], ["filament"])
+        self.apply("filament", self.ids(remaining))
+        self.assertEqual(self.host.begins[-1], ("filament", (1,)))
         self.assertEqual(self.page.last("analysis")["rows"], [])
-        self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-        self.assertIn("Нет рекомендаций", self.status()["text"])
-        self.assertEqual(len(self.host.commits), 1)
+
+    def test_apply_declined_confirmation_applies_nothing(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.answer = "no"
+        status = self.apply("print", self.ids(rows))
+        self.assertEqual(self.host.begins, [])
+        self.assertEqual(status["level"], "info")
+        self.assertIn("отменено", status["text"])
+        self.assertIsNone(self.page.last("analysis"))
+
+    def test_apply_rejects_stale_values(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.values["print"]["layer_height"] = "0.28"
+        self.page.clear()
+        self.app.handle({"type": "apply", "category": "print", "selected": self.ids(rows)})
+        status = self.status()
+        self.assertEqual(status["level"], "error")
+        self.assertIn("layer_height", status["text"])
+        self.assertEqual(self.host.dialogs, [])
+        self.assertEqual(self.host.begins, [])
+        self.assertIsNone(self.page.last("analysis"))
+
+    def test_apply_rejects_switched_preset(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.names["print"] = "another preset"
+        self.app.handle({"type": "apply", "category": "print", "selected": self.ids(rows)})
+        self.assertIn("заново", self.status()["text"])
+        self.assertEqual(self.host.begins, [])
+
+    def test_apply_target_mismatch_does_not_commit(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.target_override = "unexpected"
+        status = self.apply("print", self.ids(rows))
+        self.assertEqual(self.host.commits, [])
+        self.assertEqual(status["level"], "error")
+
+    def test_filament_apply_uses_first_assigned_slot(self):
+        self.host.slots = ["A", "filament preset", "filament preset"]
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.apply("filament", self.ids(rows, "filament"))
+        self.assertEqual(self.host.begins, [("filament", (2,))])
+        self.assertEqual(self.host.commits, [("filament", [("nozzle_temperature", "210")])])
+
+    def test_filament_apply_without_assigned_slot_refuses(self):
+        self.host.slots = ["A", "B"]
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.app.handle({"type": "apply", "category": "filament", "selected": self.ids(rows)})
+        self.assertEqual(self.status()["level"], "error")
+        self.assertIn("слот", self.status()["text"])
+        self.assertEqual(self.host.begins, [])
+
+    def test_commit_value_error_reports_invalid(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.commit_error = ValueError("bad value")
+        status = self.apply("print", self.ids(rows))
+        self.assertIn("ничего не применено", status["text"])
+        self.assertIn("bad value", status["text"])
+        self.assertIsNone(self.page.last("analysis"))
+
+    def test_begin_update_cancel_reports_cancelled(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        self.host.begin_error = RuntimeError("cancelled by user")
+        status = self.apply("print", self.ids(rows))
+        self.assertEqual(status["level"], "info")
+        self.assertIn("отменено", status["text"])
 
     def test_apply_without_selection(self):
         self.configure()
-        self.analyze()
-        for selected in ([], ["unknown"], "all", None):
-            self.app.handle({"type": "apply", "selected": selected})
+        rows = self.analyze()["rows"]
+        for category, selected in (("print", []), ("print", ["unknown"]), ("print", "all"), ("print", None),
+                                   ("filament", self.ids(rows, "print"))):
+            self.app.handle({"type": "apply", "category": category, "selected": selected})
             self.assertIn("Отметьте", self.status()["text"])
-        self.assertEqual(self.host.commits, [])
+        for category in (None, "process", 5):
+            self.app.handle({"type": "apply", "category": category, "selected": self.ids(rows)})
+            self.assertIn("категор", self.status()["text"])
+        self.assertEqual(self.host.dialogs, [])
 
-    def test_conflict_discards_rows_without_retry(self):
+    def test_messages_during_apply_are_refused(self):
         self.configure()
         rows = self.analyze()["rows"]
-        self.host.commit_result = {"status": "conflict", "revision": "rev-9", "affected": [], "diagnostics": []}
-        self.app.handle({"type": "apply", "selected": [r["id"] for r in rows]})
-        self.assertEqual(len(self.host.commits), 1)
-        self.assertEqual(len(self.host.commits[0]["operations"]), 2)
-        self.assertIn("заново", self.status()["text"])
-        self.assertEqual(self.page.last("analysis")["rows"], [])
-        self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-        self.assertEqual(len(self.host.commits), 1)
+        entered, release = threading.Event(), threading.Event()
 
-    def test_cancelled_and_invalid_keep_rows(self):
-        self.configure()
-        rows = self.analyze()["rows"]
-        for result in ({"status": "cancelled", "diagnostics": []},
-                       {"status": "invalid", "diagnostics": [{"message": "bad value"}]}):
-            self.page.clear()
-            self.host.commit_result = result
-            self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-            self.assertIsNone(self.page.last("analysis"))
-        self.assertIn("bad value", self.status()["text"])
-        self.assertEqual(len(self.host.commits), 2)
+        def block():
+            entered.set()
+            release.wait(5)
 
-    def test_commit_exception_reported(self):
-        self.configure()
-        rows = self.analyze()["rows"]
-
-        def boom(request):
-            raise RuntimeError("native failure")
-
-        self.host.on_commit = boom
-        self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-        self.assertIn("native failure", self.status()["text"])
-
-    def test_messages_during_commit_dialog_are_refused(self):
-        self.configure()
-        rows = self.analyze()["rows"]
-
-        def nested(request):
-            self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-            self.app.handle({"type": "analyze"})
-            self.app.handle({"type": "init"})
+        self.host.on_begin = block
+        self.page.clear()
+        self.app.handle({"type": "apply", "category": "print", "selected": self.ids(rows)})
+        self.assertTrue(entered.wait(5))
+        for message in ({"type": "apply", "category": "filament", "selected": self.ids(rows)},
+                        {"type": "analyze"}, {"type": "cancel"}):
+            self.app.handle(message)
             self.assertIn("Дождитесь", self.status()["text"])
-
-        self.host.on_commit = nested
-        self.app.handle({"type": "apply", "selected": [rows[0]["id"]]})
-        self.assertEqual(len(self.host.commits), 1)
+        release.set()
+        self.page.wait_for(lambda m: m.get("type") == "state" and not m["busy"])
+        self.assertEqual(len(self.host.begins), 1)
         self.assertEqual(len(self.fake.requests), 1)
+
+    def test_unload_during_apply_drops_result(self):
+        self.configure()
+        rows = self.analyze()["rows"]
+        entered, release = threading.Event(), threading.Event()
+
+        def block():
+            entered.set()
+            release.wait(5)
+
+        self.host.on_begin = block
+        self.app.handle({"type": "apply", "category": "print", "selected": self.ids(rows)})
+        self.assertTrue(entered.wait(5))
+        started = time.monotonic()
+        self.app.unload()
+        self.assertLess(time.monotonic() - started, ai.SHUTDOWN_TIMEOUT_S + 1)
+        count = len(self.page.messages)
+        release.set()
+        time.sleep(0.3)
+        self.assertEqual(len(self.page.messages), count)
+
+    def test_gemini_permission_error_message(self):
+        self.configure()
+        denied = urllib.error.URLError(PermissionError("plugin is not allowed to connect"))
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=denied):
+            self.app.handle({"type": "analyze"})
+            status = self.page.wait_for(lambda m: m.get("type") == "status" and m["level"] == "error")
+        self.assertIn("«Плагины»", status["text"])
+        self.assertIn("127.0.0.1", status["text"])
+        self.assertNotIn("Traceback", status["text"])
 
     def test_invalid_model_answer_shows_error_without_rows(self):
         self.configure()
@@ -369,7 +514,7 @@ class AutomaticModeTests(AppTestCase):
 class StorageMissingTests(AppTestCase):
     def setUp(self):
         super().setUp()
-        self.host.features = [f for f in ALL_FEATURES if f != "plugin_storage.v1"]
+        del self.host.plugin
         self.app.unload()
         self.app.load()
 
@@ -393,7 +538,6 @@ class ManualModeTests(AppTestCase):
         self.app.handle({"type": "init"})
         state = self.page.last("state")
         self.assertEqual(state["mode"], "manual")
-        self.assertEqual(state["apply_label"], "Скопировать инструкции")
         self.assertFalse(state["storage_ok"])
         self.configure()
         rows = self.analyze()["rows"]
@@ -426,6 +570,8 @@ def make_fake_orca(host):
     fake.plugins, fake.capabilities = [], []
     fake.plugin = lambda cls: fake.plugins.append(cls) or cls
     fake.register_capability = fake.capabilities.append
+    fake.permission_requests = []
+    fake.request_permissions = lambda **kwargs: fake.permission_requests.append(kwargs)
     fake.host = host
     return fake
 
@@ -454,6 +600,8 @@ class OrcaLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.orca.plugins), 1)
         self.orca.plugins[0]().register_capabilities()
         self.assertEqual(self.orca.capabilities, [self.module.AiAssistPage])
+        self.assertEqual(self.orca.permission_requests,
+                         [{"network": ["https://generativelanguage.googleapis.com"], "threading": True}])
         page = self.module.AiAssistPage()
         self.assertEqual(page.get_name(), "AI Assist")
         self.assertIn("<html", page.get_ui())
@@ -469,8 +617,10 @@ class OrcaLifecycleTests(unittest.TestCase):
                     page.on_message({"type": "consent", "value": True})
                 page.on_message({"type": "analyze"})
                 rows = self.wait_posted(page, has_rows)["rows"]
-                page.on_message({"type": "apply", "selected": [rows[0]["id"]]})
-                self.assertEqual(self.host.commits[-1]["operations"][0]["values"], {"layer_height": "0.16"})
+                page.on_message({"type": "apply", "category": "print", "selected": [rows[0]["id"]]})
+                self.wait_posted(page, lambda m: m.get("type") == "status" and m["level"] == "ok")
+                self.assertEqual(self.host.commits[-1], ("print", [("layer_height", "0.16")]))
+                self.host.values["print"]["layer_height"] = "0.2"
                 page.on_unload()
                 page.on_unload()
                 page.on_message({"type": "init"})
@@ -478,6 +628,11 @@ class OrcaLifecycleTests(unittest.TestCase):
 
         self.assertEqual(len(self.host.commits), 2)
         self.assertFalse([t for t in threading.enumerate() if t.name.startswith("ai-assist-")])
+
+    def test_registration_without_permission_api(self):
+        del self.orca.request_permissions
+        self.orca.plugins[0]().register_capabilities()
+        self.assertEqual(self.orca.capabilities, [self.module.AiAssistPage])
 
 
 if __name__ == "__main__":
