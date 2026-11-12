@@ -1,0 +1,1169 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["qrcode>=7.4,<9", "Pillow>=10,<13", "zxing-cpp>=2.3,<4"]
+#
+# [tool.orcaslicer.plugin]
+# name = "Filament QR"
+# description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
+# author = "OrcaSlicer-AI"
+# version = "1.0.0"
+# ///
+"""Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
+
+Each spool gets a short code (FQ-XXXXXX) bound to an OrcaSlicer filament
+profile. Scanning a label with a phone on the local network queues a request
+"put this profile into filament slot N". The queue lives in SQLite and survives
+restarts. On a host with the plugin API v1 the plugin asks OrcaSlicer to select
+the profile (OrcaSlicer shows its own confirmation dialog); on an official
+host it only tells the user which profile to pick by hand.
+
+Threading: the LAN server threads only touch the store and the in-memory
+session table. Every orca.host call happens in Pages callbacks on the GUI
+thread.
+"""
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import socket
+import sqlite3
+import tempfile
+import threading
+import time
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    import orca  # the embedded OrcaSlicer module; an unrelated `orca` package may exist elsewhere
+    if not hasattr(orca, 'host'):
+        orca = None
+except ImportError:
+    orca = None
+
+DEFAULT_PORT = 8765
+MAX_JSON_BODY = 16 * 1024
+MAX_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_IMAGE_SIDE = 2600
+MAX_IMAGE_PIXELS = MAX_IMAGE_SIDE * MAX_IMAGE_SIDE
+MAX_DECLARED_JPEG_PIXELS = 64_000_000
+MAX_HTTP_WORKERS = 8
+MAX_CONCURRENT_DECODES = 2
+REQUEST_TIMEOUT = 10.0
+CODE_RE = re.compile(r'^FQ-[0-9A-F]{6}$')
+
+ACTIVE_STATUSES = ('queued', 'manual', 'needs_attention', 'cancelled')
+MAX_AUTO_ATTEMPTS = 3
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def normalize_code(text):
+    text = str(text).strip().upper()
+    if text.startswith('FQ:'):
+        text = text[3:]
+    if re.fullmatch(r'[0-9A-F]{6}', text):
+        text = 'FQ-' + text
+    if not CODE_RE.fullmatch(text):
+        raise ValueError('Ожидался код вида FQ-XXXXXX (шесть шестнадцатеричных символов)')
+    return text
+
+
+# --------------------------------------------------------------------------- labels
+
+def qr_svg(spool):
+    """Self-contained printable 56 x 72 mm label. The symbol uses ECC H."""
+    import qrcode
+    from qrcode.constants import ERROR_CORRECT_H
+
+    code = normalize_code(spool['code'])
+    material = re.sub(r'[^\w+.-]', '', str(spool.get('material', '')).upper())[:10] or 'FILAMENT'
+    brand = str(spool.get('brand', ''))
+    title = str(spool.get('profile', ''))
+    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_H, border=4, box_size=1)
+    qr.add_data('FQ:' + code)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    x0, y0, size = 5.5, 14.0, 45.0
+    step = size / len(matrix)
+    rects = ''.join(
+        f'<rect x="{x0 + ix * step:.4f}" y="{y0 + iy * step:.4f}" width="{step + .008:.4f}" height="{step + .008:.4f}"/>'
+        for iy, row in enumerate(matrix) for ix, dark in enumerate(row) if dark)
+    cy = y0 + size / 2
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="56mm" height="72mm" viewBox="0 0 56 72">'
+        '<rect width="56" height="72" fill="white"/>'
+        '<rect x="0.5" y="0.5" width="55" height="71" rx="2" fill="none" stroke="#303644" stroke-width=".35"/>'
+        '<text x="28" y="5.5" text-anchor="middle" font-family="Arial,sans-serif" font-size="3.5" '
+        'font-weight="bold" fill="#111">FILAMENT QR</text>'
+        f'<text x="28" y="10" text-anchor="middle" font-family="Arial,sans-serif" font-size="3.2" '
+        f'fill="#333">{escape((brand or title)[:26])}</text>'
+        f'<g fill="#111">{rects}</g>'
+        f'<rect x="{28 - 6.2:.2f}" y="{cy - 4.6:.2f}" width="12.4" height="9.2" rx=".9" fill="white" '
+        'stroke="#111" stroke-width=".35"/>'
+        f'<text x="28" y="{cy - 0.9:.2f}" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.9" '
+        f'font-weight="bold" fill="#111">{escape(material)}</text>'
+        f'<text x="28" y="{cy + 2.5:.2f}" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.25" '
+        f'font-weight="bold" fill="#111">{escape(code[3:])}</text>'
+        '<text x="28" y="62.8" text-anchor="middle" font-family="Arial,sans-serif" font-size="4.1" '
+        f'font-weight="bold" fill="#111">{escape(material)} · {escape(code[3:])}</text>'
+        f'<text x="28" y="67.2" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.15" '
+        f'fill="#333">{escape(title[:34])}</text>'
+        '</svg>')
+
+
+def label_page(spool):
+    return (f'<!doctype html><meta charset="utf-8"><title>Этикетка {escape(spool["code"])}</title><style>'
+            'body{font:16px Arial;text-align:center;margin:24px}svg{max-width:96vw;height:auto}'
+            '@page{margin:0;size:56mm 72mm}@media print{body{margin:0}button{display:none}}'
+            '</style><button onclick="print()">Печать 56 × 72 мм</button>'
+            f'<div>{qr_svg(spool)}</div>')
+
+
+# --------------------------------------------------------------------------- store
+
+SCHEMA_VERSION = 1
+
+
+class Store:
+    """SQLite store for spools and the durable scan queue. Safe to share between threads."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.migrate()
+
+    @contextmanager
+    def _db(self):
+        with self._lock:
+            db = sqlite3.connect(str(self.path), timeout=5)
+            db.row_factory = sqlite3.Row
+            try:
+                with db:
+                    yield db
+            finally:
+                db.close()
+
+    def schema_version(self):
+        with self._db() as db:
+            return db.execute('PRAGMA user_version').fetchone()[0]
+
+    def migrate(self):
+        with self._db() as db:
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError('База катушек создана более новой версией плагина')
+            if version < 1:
+                # Version 0 is either an empty file or the prototype, which had the same spools table.
+                db.execute('''CREATE TABLE IF NOT EXISTS spools (
+                    code TEXT PRIMARY KEY, profile TEXT NOT NULL, printer TEXT NOT NULL,
+                    material TEXT NOT NULL, brand TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '', created TEXT NOT NULL)''')
+                db.execute('''CREATE TABLE IF NOT EXISTS pending_scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL, profile TEXT NOT NULL, slot INTEGER NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    message TEXT NOT NULL DEFAULT '', host_revision TEXT NOT NULL DEFAULT '',
+                    created TEXT NOT NULL, updated TEXT NOT NULL)''')
+                db.execute('CREATE INDEX IF NOT EXISTS pending_status ON pending_scans(status, id)')
+                db.execute('PRAGMA user_version = 1')
+
+    # spools
+
+    def list_spools(self):
+        with self._db() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM spools ORDER BY created DESC, code DESC')]
+
+    def get_spool(self, code):
+        code = normalize_code(code)
+        with self._db() as db:
+            row = db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone()
+            return dict(row) if row else None
+
+    def add_spool(self, profile, printer, material, brand='', notes='', token=None):
+        profile, printer = str(profile).strip(), str(printer).strip()
+        material, brand, notes = str(material).strip() or 'FILAMENT', str(brand).strip(), str(notes).strip()
+        if not profile:
+            raise ValueError('Выберите профиль филамента')
+        if len(profile) > 180 or len(printer) > 180 or len(material) > 40 or len(brand) > 80 or len(notes) > 300:
+            raise ValueError('Слишком длинное значение')
+        token = token or (lambda: secrets.token_hex(3).upper())
+        with self._db() as db:
+            for _ in range(20):
+                code = 'FQ-' + token()
+                try:
+                    db.execute('INSERT INTO spools VALUES (?,?,?,?,?,?,?)',
+                               (code, profile, printer, material, brand, notes, utc_now()))
+                except sqlite3.IntegrityError:
+                    continue
+                return dict(db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone())
+        raise RuntimeError('Не удалось создать уникальный код')
+
+    def delete_spool(self, code):
+        code = normalize_code(code)
+        with self._db() as db:
+            return db.execute('DELETE FROM spools WHERE code=?', (code,)).rowcount > 0
+
+    # scan queue
+
+    def enqueue_scan(self, code, slot, status='queued'):
+        spool = self.get_spool(code)
+        if spool is None:
+            raise LookupError('Катушка с этим кодом не найдена')
+        now = utc_now()
+        with self._db() as db:
+            cur = db.execute('INSERT INTO pending_scans (code, profile, slot, status, created, updated) '
+                             'VALUES (?,?,?,?,?,?)', (spool['code'], spool['profile'], int(slot), status, now, now))
+            return dict(db.execute('SELECT * FROM pending_scans WHERE id=?', (cur.lastrowid,)).fetchone())
+
+    def get_pending(self, pending_id):
+        with self._db() as db:
+            row = db.execute('SELECT * FROM pending_scans WHERE id=?', (int(pending_id),)).fetchone()
+            return dict(row) if row else None
+
+    def list_pending(self, statuses=ACTIVE_STATUSES):
+        marks = ','.join('?' * len(statuses))
+        with self._db() as db:
+            return [dict(r) for r in db.execute(
+                f'SELECT * FROM pending_scans WHERE status IN ({marks}) ORDER BY id', tuple(statuses))]
+
+    def next_queued(self):
+        with self._db() as db:
+            row = db.execute("SELECT * FROM pending_scans WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            return dict(row) if row else None
+
+    def mark(self, pending_id, status, message='', attempted=False, host_revision=None):
+        with self._db() as db:
+            db.execute('UPDATE pending_scans SET status=?, message=?, updated=?, attempts=attempts+?, '
+                       'host_revision=COALESCE(?, host_revision) WHERE id=?',
+                       (status, str(message)[:300], utc_now(), 1 if attempted else 0, host_revision,
+                        int(pending_id)))
+
+    def recent_done(self, limit=5):
+        with self._db() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT * FROM pending_scans WHERE status='done' ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+# --------------------------------------------------------------------------- authentication
+
+class AuthError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+class SessionManager:
+    """PIN login for phones. Tokens are kept only as SHA-256 digests."""
+
+    FAILURE_WINDOW = 60.0
+    MAX_FAILURES = 6
+    MAX_TRACKED_IPS = 256
+    MAX_SESSIONS = 64
+    IDLE_TIMEOUT = 8 * 3600.0
+    ABSOLUTE_TIMEOUT = 24 * 3600.0
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._sessions = {}   # digest -> (created, last_seen)
+        self._failures = {}   # ip -> [timestamps]
+        self.pin = self._new_pin()
+
+    @staticmethod
+    def _new_pin():
+        return f'{secrets.randbelow(1_000_000):06d}'
+
+    @staticmethod
+    def _digest(token):
+        return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+    def authenticate(self, pin, client_ip):
+        now = self._clock()
+        with self._lock:
+            attempts = [t for t in self._failures.get(client_ip, ()) if now - t < self.FAILURE_WINDOW]
+            if len(attempts) >= self.MAX_FAILURES:
+                self._failures[client_ip] = attempts
+                raise AuthError(429, 'Слишком много попыток. Повторите через минуту')
+            if not secrets.compare_digest(str(pin).encode('utf-8'), self.pin.encode('utf-8')):
+                attempts.append(now)
+                self._failures[client_ip] = attempts
+                self._prune_failures(now)
+                raise AuthError(403, 'Неверный PIN')
+            self._failures.pop(client_ip, None)
+            self._prune_sessions(now)
+            if len(self._sessions) >= self.MAX_SESSIONS:
+                oldest = min(self._sessions, key=lambda d: self._sessions[d][1])
+                del self._sessions[oldest]
+            token = secrets.token_urlsafe(32)
+            self._sessions[self._digest(token)] = (now, now)
+            return token
+
+    def validate(self, token):
+        if not token:
+            return False
+        now = self._clock()
+        digest = self._digest(token)
+        with self._lock:
+            entry = self._sessions.get(digest)
+            if entry is None:
+                return False
+            created, last_seen = entry
+            if now - created > self.ABSOLUTE_TIMEOUT or now - last_seen > self.IDLE_TIMEOUT:
+                del self._sessions[digest]
+                return False
+            self._sessions[digest] = (created, now)
+            return True
+
+    def revoke(self, token):
+        with self._lock:
+            self._sessions.pop(self._digest(token or ''), None)
+
+    def revoke_all(self):
+        with self._lock:
+            self._sessions.clear()
+
+    def rotate_pin(self):
+        with self._lock:
+            self.pin = self._new_pin()
+            self._sessions.clear()
+            self._failures.clear()
+            return self.pin
+
+    def session_count(self):
+        now = self._clock()
+        with self._lock:
+            self._prune_sessions(now)
+            return len(self._sessions)
+
+    def _prune_sessions(self, now):
+        for digest, (created, last_seen) in list(self._sessions.items()):
+            if now - created > self.ABSOLUTE_TIMEOUT or now - last_seen > self.IDLE_TIMEOUT:
+                del self._sessions[digest]
+
+    def _prune_failures(self, now):
+        for ip, stamps in list(self._failures.items()):
+            if not any(now - t < self.FAILURE_WINDOW for t in stamps):
+                del self._failures[ip]
+        while len(self._failures) > self.MAX_TRACKED_IPS:
+            self._failures.pop(next(iter(self._failures)))
+
+
+# --------------------------------------------------------------------------- QR decoding
+
+class DecodeError(ValueError):
+    pass
+
+
+def decode_qr_image(data):
+    """Return the normalized FQ codes found in an image, rejecting oversized input before decoding."""
+    if len(data) > MAX_IMAGE_BYTES:
+        raise DecodeError('Изображение слишком большое')
+    try:
+        from PIL import Image, ImageOps
+        import zxingcpp
+    except ImportError as exc:
+        raise DecodeError('Распознавание фото недоступно: не установлены Pillow/zxing-cpp') from exc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', Image.DecompressionBombWarning)
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                width, height = img.size
+                # JPEG can be decoded at 1/2..1/8 scale, so large phone photos stay cheap; other formats cannot.
+                limit = MAX_DECLARED_JPEG_PIXELS if img.format == 'JPEG' else MAX_IMAGE_PIXELS * 4
+                if width * height > limit:
+                    raise DecodeError('Разрешение изображения слишком большое')
+                img.draft('RGB', (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+                img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+                img = ImageOps.exif_transpose(img)
+                results = zxingcpp.read_barcodes(img)
+        except DecodeError:
+            raise
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise DecodeError('Разрешение изображения слишком большое') from exc
+        except Exception as exc:
+            raise DecodeError('Не удалось прочитать изображение') from exc
+
+    codes = []
+    for result in results:
+        try:
+            code = normalize_code(result.text)
+        except ValueError:
+            continue
+        if code not in codes:
+            codes.append(code)
+    if not codes:
+        raise DecodeError('QR Filament на фото не найден. Подойдите ближе или введите код вручную')
+    return codes
+
+
+# --------------------------------------------------------------------------- OrcaSlicer host
+
+AUTOMATIC_FEATURES = frozenset({'preset_snapshot.v1', 'preset_transaction.v1', 'preset_select.v1'})
+
+
+@dataclass
+class HostCapabilities:
+    mode: str                      # 'automatic' | 'manual'
+    storage: bool
+    features: frozenset = frozenset()
+
+    @classmethod
+    def discover(cls, orca_module):
+        host = getattr(orca_module, 'host', None)
+        features = frozenset()
+        try:
+            info = host.api_info()
+            features = frozenset(str(f) for f in info.get('features', ()))
+        except Exception:
+            pass
+        v1 = getattr(host, 'v1', None)
+        storage = 'plugin_storage.v1' in features and callable(getattr(v1, 'plugin_storage', None))
+        presets = getattr(v1, 'presets', None)
+        automatic = (AUTOMATIC_FEATURES <= features and callable(getattr(presets, 'snapshot', None))
+                     and callable(getattr(presets, 'commit', None)))
+        return cls('automatic' if automatic else 'manual', storage, features)
+
+
+@dataclass
+class WorkspaceState:
+    printer: str = ''
+    slots: list = field(default_factory=list)      # preset name per zero-based slot
+    profiles: list = field(default_factory=list)   # compatible, visible filament presets
+    revision: str = ''
+    dirty: bool = False
+
+
+def read_workspace(host, caps):
+    """Read printer, filament slots and compatible profiles. GUI thread only."""
+    if caps.mode == 'automatic':
+        snap = host.v1.presets.snapshot()
+        profiles = [p['name'] for p in snap.get('resources', {}).get('filament', ())
+                    if p.get('visible') and p.get('compatible')]
+        return WorkspaceState(
+            printer=str(snap.get('active_printer', {}).get('name', '')),
+            slots=[str(s.get('preset_name', '')) for s in snap.get('filament_slots', ())],
+            profiles=profiles,
+            revision=str(snap.get('revision', '')),
+            dirty=bool(snap.get('presets_dirty')))
+    bundle = host.preset_bundle()
+    filaments = bundle.filaments
+    profiles = []
+    for i in range(filaments.size()):
+        preset = filaments.preset(i)
+        if preset.is_visible and preset.is_compatible:
+            profiles.append(preset.name)
+    edited = filaments.edited_preset()
+    return WorkspaceState(printer=str(bundle.printers.selected_preset_name()),
+                          slots=list(bundle.current_filament_preset_names()),
+                          profiles=profiles,
+                          dirty=bool(edited.is_dirty) if edited else False)
+
+
+RESULT_MESSAGES = {
+    'cancelled': 'Отменено в OrcaSlicer — можно повторить',
+    'invalid_slot': 'Такого слота филамента нет у текущего принтера',
+    'not_found': 'Профиль филамента не найден в OrcaSlicer',
+    'incompatible': 'Профиль не совместим с текущим принтером',
+    'invalid': 'OrcaSlicer отклонил запрос',
+    'unsupported': 'OrcaSlicer сейчас не может выполнить выбор',
+    'error': 'Ошибка OrcaSlicer при выборе профиля',
+}
+
+
+def attempt_pending(host, store, pending, caps):
+    """Try to put pending['profile'] into pending['slot']. GUI thread only. Returns the new status."""
+    pid, slot, profile = pending['id'], int(pending['slot']), pending['profile']
+    try:
+        ws = read_workspace(host, caps)
+    except Exception as exc:
+        store.mark(pid, 'needs_attention', f'Не удалось прочитать состояние OrcaSlicer: {exc}')
+        return 'needs_attention'
+
+    if slot >= len(ws.slots):
+        store.mark(pid, 'needs_attention', f'У принтера нет слота {slot + 1}')
+        return 'needs_attention'
+    if ws.slots[slot] == profile:
+        store.mark(pid, 'done', 'Профиль уже выбран', host_revision=ws.revision)
+        return 'done'
+    if profile not in ws.profiles:
+        store.mark(pid, 'needs_attention', 'Профиль отсутствует или не совместим с текущим принтером')
+        return 'needs_attention'
+    if caps.mode != 'automatic':
+        store.mark(pid, 'manual', f'Выберите «{profile}» в слоте {slot + 1} вручную')
+        return 'manual'
+
+    request = {'expected_revision': ws.revision, 'interaction': 'require_user_confirmation',
+               'operations': [{'op': 'select', 'preset_type': 'filament', 'name': profile,
+                               'scope': {'slot': slot}}]}
+    try:
+        result = host.v1.presets.commit(request)
+    except Exception as exc:
+        store.mark(pid, 'needs_attention', f'Ошибка вызова OrcaSlicer: {exc}', attempted=True)
+        return 'needs_attention'
+
+    status = result.get('status')
+    if status == 'applied':
+        changed = [a for a in result.get('affected', ()) if a.get('op') == 'select']
+        if any(a.get('slot') == slot and a.get('name') == profile for a in changed) or not changed:
+            store.mark(pid, 'done', 'Профиль выбран', attempted=True, host_revision=result.get('revision', ''))
+            return 'done'
+        store.mark(pid, 'needs_attention', 'OrcaSlicer применил другое изменение', attempted=True)
+        return 'needs_attention'
+    if status == 'conflict':
+        if pending.get('attempts', 0) + 1 < MAX_AUTO_ATTEMPTS:
+            store.mark(pid, 'queued', 'Состояние OrcaSlicer изменилось, повтор', attempted=True)
+            return 'queued'
+        store.mark(pid, 'needs_attention', 'Состояние OrcaSlicer постоянно меняется', attempted=True)
+        return 'needs_attention'
+    message = RESULT_MESSAGES.get(status, 'Неизвестный ответ OrcaSlicer')
+    if result.get('message'):
+        message += f' ({result["message"]})'
+    new_status = 'cancelled' if status == 'cancelled' else 'needs_attention'
+    store.mark(pid, new_status, message, attempted=True)
+    return new_status
+
+
+# --------------------------------------------------------------------------- shared service state
+
+class Service:
+    """State shared by the LAN server and the GUI. Never calls orca."""
+
+    def __init__(self, store, sessions=None):
+        self.store = store
+        self.sessions = sessions or SessionManager()
+        self.decode_slots = threading.BoundedSemaphore(MAX_CONCURRENT_DECODES)
+        self._lock = threading.Lock()
+        self._workspace = WorkspaceState()
+        self.queue_changed = threading.Event()
+
+    def set_workspace(self, ws):
+        with self._lock:
+            self._workspace = ws
+
+    def workspace(self):
+        with self._lock:
+            return self._workspace
+
+    def scan(self, code, slot=0):
+        code = normalize_code(code)
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            raise ValueError('Некорректный номер слота') from None
+        slots = len(self.workspace().slots)
+        if slot < 0 or (slots and slot >= slots):
+            raise ValueError('Такого слота филамента нет')
+        pending = self.store.enqueue_scan(code, slot)
+        self.queue_changed.set()
+        return pending
+
+    def phone_status(self):
+        ws = self.workspace()
+        return {'printer': ws.printer, 'slots': ws.slots,
+                'pending': self.store.list_pending(), 'recent': self.store.recent_done(),
+                'spools': self.store.list_spools()}
+
+
+# --------------------------------------------------------------------------- LAN server
+
+class _BoundedServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = False
+
+    def __init__(self, address, handler, service):
+        self.service = service
+        self.workers = threading.BoundedSemaphore(MAX_HTTP_WORKERS)
+        self.active = 0
+        self.active_cv = threading.Condition()
+        super().__init__(address, handler)
+
+    def handle_error(self, request, client_address):
+        pass  # clients dropping connections are routine; nothing useful to report
+
+    def process_request(self, request, client_address):
+        if not self.workers.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        with self.active_cv:
+            self.active += 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release()
+
+    def _release(self):
+        self.workers.release()
+        with self.active_cv:
+            self.active -= 1
+            self.active_cv.notify_all()
+
+    def wait_idle(self, timeout):
+        deadline = time.monotonic() + timeout
+        with self.active_cv:
+            while self.active > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.active_cv.wait(left)
+        return True
+
+
+SECURITY_HEADERS = {
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                               "img-src data:; connect-src 'self'; form-action 'none'; frame-ancestors 'none'",
+}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = 'FilamentQR/1.0'
+    timeout = REQUEST_TIMEOUT
+
+    def log_message(self, fmt, *args):
+        pass
+
+    @property
+    def service(self):
+        return self.server.service
+
+    def respond(self, status, content, mime='application/json; charset=utf-8', headers=None):
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, ensure_ascii=False).encode('utf-8')
+        elif isinstance(content, str):
+            content = content.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', mime)
+        self.send_header('Content-Length', str(len(content)))
+        for key, value in SECURITY_HEADERS.items():
+            self.send_header(key, value)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(content)
+
+    def token(self):
+        for part in self.headers.get('Cookie', '').split(';'):
+            name, _, value = part.strip().partition('=')
+            if name == 'fq_sid':
+                return value
+        return ''
+
+    def authorized(self):
+        return self.service.sessions.validate(self.token())
+
+    def is_loopback(self):
+        return self.client_address[0] in ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+
+    def read_body(self, limit):
+        raw = self.headers.get('Content-Length')
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError('Не указан размер данных') from None
+        if length <= 0 or length > limit:
+            raise ValueError('Некорректный размер данных')
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError('Данные получены не полностью')
+        return body
+
+    def read_json(self):
+        try:
+            data = json.loads(self.read_body(MAX_JSON_BODY))
+        except json.JSONDecodeError:
+            raise ValueError('Некорректный JSON') from None
+        if not isinstance(data, dict):
+            raise ValueError('Некорректный JSON')
+        return data
+
+    def do_GET(self):
+        try:
+            path = unquote(urlparse(self.path).path)
+            if path == '/':
+                return self.respond(200, PHONE_HTML, 'text/html; charset=utf-8')
+            if path == '/api/status':
+                if not self.authorized():
+                    return self.respond(401, {'error': 'Введите PIN'})
+                return self.respond(200, self.service.phone_status())
+            if path.startswith('/label/'):
+                if not (self.authorized() or self.is_loopback()):
+                    return self.respond(401, 'Требуется вход', 'text/plain; charset=utf-8')
+                spool = self.service.store.get_spool(path[len('/label/'):])
+                if not spool:
+                    return self.respond(404, 'Катушка не найдена', 'text/plain; charset=utf-8')
+                return self.respond(200, label_page(spool), 'text/html; charset=utf-8')
+            return self.respond(404, {'error': 'Не найдено'})
+        except ValueError as exc:
+            return self.respond(400, {'error': str(exc)})
+        except Exception:
+            return self.respond(500, {'error': 'Внутренняя ошибка'})
+
+    def do_POST(self):
+        try:
+            url = urlparse(self.path)
+            if url.path == '/api/auth':
+                body = self.read_json()
+                try:
+                    token = self.service.sessions.authenticate(body.get('pin', ''), self.client_address[0])
+                except AuthError as exc:
+                    return self.respond(exc.status, {'error': str(exc)})
+                cookie = (f'fq_sid={token}; HttpOnly; SameSite=Strict; Path=/; '
+                          f'Max-Age={int(SessionManager.ABSOLUTE_TIMEOUT)}')
+                return self.respond(200, {'ok': True}, headers={'Set-Cookie': cookie})
+            if not self.authorized():
+                return self.respond(401, {'error': 'Введите PIN'})
+            if url.path == '/api/logout':
+                self.service.sessions.revoke(self.token())
+                return self.respond(200, {'ok': True}, headers={'Set-Cookie': 'fq_sid=; Max-Age=0; Path=/'})
+            if url.path == '/api/scan':
+                body = self.read_json()
+                return self.respond(200, {'pending': self.service.scan(body.get('code', ''), body.get('slot', 0))})
+            if url.path == '/api/decode':
+                slot = parse_qs(url.query).get('slot', ['0'])[0]
+                if not self.service.decode_slots.acquire(blocking=False):
+                    return self.respond(429, {'error': 'Распознавание занято, повторите через секунду'})
+                try:
+                    codes = decode_qr_image(self.read_body(MAX_IMAGE_BYTES))
+                finally:
+                    self.service.decode_slots.release()
+                for code in codes:
+                    try:
+                        return self.respond(200, {'pending': self.service.scan(code, slot)})
+                    except LookupError:
+                        continue
+                return self.respond(404, {'error': 'QR распознан, но такой катушки нет в базе'})
+            return self.respond(404, {'error': 'Не найдено'})
+        except LookupError as exc:
+            return self.respond(404, {'error': str(exc)})
+        except ValueError as exc:
+            return self.respond(400, {'error': str(exc)})
+        except Exception:
+            return self.respond(500, {'error': 'Внутренняя ошибка'})
+
+
+class FilamentHttpServer:
+    def __init__(self, service):
+        self.service = service
+        self._server = None
+        self._thread = None
+
+    @property
+    def address(self):
+        return self._server.server_address[:2] if self._server else None
+
+    def start(self, bind, port):
+        self.stop()
+        try:
+            self._server = _BoundedServer((bind, int(port)), _Handler, self.service)
+        except OSError as exc:
+            self._server = None
+            raise RuntimeError(f'Не удалось открыть порт {port}: {exc.strerror or exc}') from exc
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={'poll_interval': 0.2},
+                                        name='filament-qr-http', daemon=True)
+        self._thread.start()
+        return self.address
+
+    def stop(self, timeout=3.0):
+        server, thread = self._server, self._thread
+        self._server = self._thread = None
+        if server is None:
+            return True
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout)
+        return server.wait_idle(timeout) and not thread.is_alive()
+
+
+def lan_addresses():
+    try:
+        addrs = {a for a in socket.gethostbyname_ex(socket.gethostname())[2]
+                 if not a.startswith(('127.', '169.254.'))}
+    except OSError:
+        addrs = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('192.0.2.1', 9))  # no packet is sent for UDP connect
+            addrs.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(a for a in addrs if not a.startswith('127.'))
+
+
+# --------------------------------------------------------------------------- settings
+
+class Settings:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lan_enabled = False
+        self.port = DEFAULT_PORT
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+            self.lan_enabled = bool(data.get('lan_enabled', False))
+            port = int(data.get('port', DEFAULT_PORT))
+            self.port = port if 1024 <= port <= 65535 else DEFAULT_PORT
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def save(self):
+        data = json.dumps({'lan_enabled': self.lan_enabled, 'port': self.port})
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.settings-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(data)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+# --------------------------------------------------------------------------- plugin controller
+
+class Controller:
+    """Everything the Pages capability does, without depending on the orca module."""
+
+    def __init__(self, host, caps, data_dir):
+        self.host = host
+        self.caps = caps
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.store = self.settings = self.service = self.server = None
+        self.server_error = ''
+        self.hosts = ['127.0.0.1']
+        self.busy = False
+        if self.data_dir is not None:
+            self.store = Store(self.data_dir / 'filament_qr.sqlite3')
+            self.settings = Settings(self.data_dir / 'settings.json')
+            self.service = Service(self.store)
+            self.server = FilamentHttpServer(self.service)
+
+    @property
+    def available(self):
+        return self.store is not None
+
+    def start_server(self):
+        if not self.available:
+            return
+        bind = '0.0.0.0' if self.settings.lan_enabled else '127.0.0.1'
+        self.hosts = (lan_addresses() or ['IP-адрес-компьютера']) if self.settings.lan_enabled else ['127.0.0.1']
+        try:
+            self.server.start(bind, self.settings.port)
+            self.server_error = ''
+        except RuntimeError as exc:
+            self.server_error = str(exc)
+
+    def shutdown(self):
+        if self.server:
+            self.server.stop()
+        if self.service:
+            self.service.sessions.revoke_all()
+
+    def refresh_workspace(self):
+        try:
+            ws = read_workspace(self.host, self.caps)
+        except Exception:
+            ws = WorkspaceState()
+        if self.service:
+            self.service.set_workspace(ws)
+        return ws
+
+    def process_queue(self):
+        """Handle queued scans one by one. Re-entrant calls (from the confirmation dialog's event loop) are no-ops.
+        Returns True when the workspace may have changed."""
+        if not self.available or self.busy:
+            return False
+        self.busy = True
+        changed = False
+        try:
+            self.service.queue_changed.clear()
+            for _ in range(10):
+                pending = self.store.next_queued()
+                if pending is None:
+                    break
+                attempt_pending(self.host, self.store, pending, self.caps)
+                changed = True
+            if self.caps.mode != 'automatic':
+                ws = self.service.workspace()
+                for pending in self.store.list_pending(('manual',)):
+                    slot = int(pending['slot'])
+                    if slot < len(ws.slots) and ws.slots[slot] == pending['profile']:
+                        self.store.mark(pending['id'], 'done', 'Профиль выбран')
+        finally:
+            self.busy = False
+        return changed
+
+    def state(self, ws=None):
+        ws = ws or self.refresh_workspace()
+        base = {'mode': self.caps.mode, 'available': self.available, 'printer': ws.printer, 'slots': ws.slots,
+                'profiles': ws.profiles, 'dirty': ws.dirty}
+        if not self.available:
+            return base
+        address = self.server.address
+        port = address[1] if address else self.settings.port
+        base.update({
+            'spools': self.store.list_spools(),
+            'pending': self.store.list_pending(),
+            'recent': self.store.recent_done(),
+            'lan_enabled': self.settings.lan_enabled,
+            'port': port,
+            'urls': [f'http://{h}:{port}/' for h in self.hosts] if address else [],
+            'pin': self.service.sessions.pin,
+            'sessions': self.service.sessions.session_count(),
+            'server_error': self.server_error,
+        })
+        return base
+
+    def handle(self, data):
+        """Handle one page message; returns the messages to post back."""
+        kind = data.get('type') if isinstance(data, dict) else None
+        if kind == 'tick':
+            ws = self.refresh_workspace()
+            if self.process_queue():
+                ws = None
+            return [{'type': 'state', 'state': self.state(ws)}]
+        if not self.available:
+            return [{'type': 'error', 'message': 'Хранилище плагина недоступно: нужна сборка OrcaSlicer с plugin API v1'}]
+        out = []
+        if kind == 'create':
+            ws = self.refresh_workspace()
+            profile = str(data.get('profile', ''))
+            if profile not in ws.profiles:
+                raise ValueError('Профиль недоступен для текущего принтера')
+            spool = self.store.add_spool(profile, ws.printer, data.get('material', ''), data.get('brand', ''),
+                                         data.get('notes', ''))
+            out += [{'type': 'created', 'spool': spool}, self.label(spool['code'])]
+        elif kind == 'delete':
+            self.store.delete_spool(data.get('code', ''))
+        elif kind == 'label':
+            out.append(self.label(data.get('code', '')))
+        elif kind == 'use':
+            self.service.scan(data.get('code', ''), data.get('slot', 0))
+            self.process_queue()
+        elif kind == 'retry':
+            self.store.mark(int(data.get('id', 0)), 'queued', 'Повтор')
+            self.process_queue()
+        elif kind == 'dismiss':
+            self.store.mark(int(data.get('id', 0)), 'dismissed')
+        elif kind == 'set_lan':
+            self.settings.lan_enabled = bool(data.get('enabled'))
+            port = int(data.get('port', self.settings.port))
+            if not 1024 <= port <= 65535:
+                raise ValueError('Порт должен быть от 1024 до 65535')
+            self.settings.port = port
+            self.settings.save()
+            self.service.sessions.revoke_all()
+            self.start_server()
+        elif kind == 'rotate_pin':
+            self.service.sessions.rotate_pin()
+        elif kind == 'revoke_sessions':
+            self.service.sessions.revoke_all()
+        else:
+            return []
+        return out + [{'type': 'state', 'state': self.state()}]
+
+    def label(self, code):
+        spool = self.store.get_spool(code)
+        if spool is None:
+            raise LookupError('Катушка не найдена')
+        return {'type': 'label', 'code': spool['code'], 'svg': qr_svg(spool)}
+
+
+# --------------------------------------------------------------------------- pages
+
+PHONE_HTML = r'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filament QR</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0e1119;color:#f1f3fa;font:16px system-ui}
+main{max-width:580px;margin:auto;padding:20px}h1{font-size:26px;margin:6px 0 12px}p,small{color:#b8bfcd}
+section{background:#1b2230;border:1px solid #313e54;border-radius:16px;padding:16px;margin:14px 0}
+input,select,button{font:inherit;border-radius:10px;padding:12px;border:1px solid #485570;width:100%;margin:6px 0}
+input,select{background:#0e1420;color:#fff}button{background:#568bff;color:#fff;font-weight:700;border:0}
+button.secondary{background:#2b3444}.error{color:#ff8e89}.ok{color:#93f1a8}.row{border-bottom:1px solid #3a4455;padding:10px 0}
+label.camera{display:block;text-align:center;background:#568bff;border-radius:10px;padding:12px;font-weight:700}
+#photo{display:none}a{color:#adc8ff}
+</style><main><h1>🧵 Filament QR</h1><p>Выбор катушки для OrcaSlicer</p>
+<section id="login"><h2>Вход</h2><p>Введите PIN со страницы Filament QR в OrcaSlicer.</p>
+<input id="pin" inputmode="numeric" maxlength="6" placeholder="6 цифр"><button id="enter">Войти</button><p id="loginmsg" class="error"></p></section>
+<div id="app" hidden><section><h2>Сканировать</h2><p id="printer"></p>
+<label for="slot">Слот филамента</label><select id="slot"></select>
+<label for="photo" class="camera">📷 Сфотографировать QR</label><input id="photo" type="file" accept="image/*" capture="environment">
+<p>Или введите код с этикетки:</p><input id="code" autocomplete="off" placeholder="FQ-12AB34"><button id="scan">Выбрать катушку</button>
+<p id="msg"></p></section><section><h2>Очередь</h2><div id="queue"></div></section>
+<section><h2>Катушки</h2><div id="spools"></div></section><button id="logout" class="secondary">Выйти</button></div></main>
+<script>
+const $=id=>document.getElementById(id);
+async function call(path,body,isFile){const opt=body===undefined?{}:{method:'POST',headers:isFile?{'Content-Type':'application/octet-stream'}:{'Content-Type':'application/json'},body:isFile?body:JSON.stringify(body)};
+ const r=await fetch(path,opt);let j={};try{j=await r.json()}catch(e){}if(!r.ok){const e=new Error(j.error||('Ошибка '+r.status));e.status=r.status;throw e}return j}
+function say(text,ok){$('msg').textContent=text;$('msg').className=ok?'ok':'error'}
+function showApp(on){$('login').hidden=on;$('app').hidden=!on}
+function slot(){return parseInt($('slot').value||'0',10)}
+$('enter').onclick=async()=>{try{await call('/api/auth',{pin:$('pin').value});showApp(true);await load()}catch(e){$('loginmsg').textContent=e.message}};
+$('logout').onclick=async()=>{try{await call('/api/logout',{})}catch(e){}showApp(false)};
+$('scan').onclick=async()=>{try{const d=await call('/api/scan',{code:$('code').value,slot:slot()});say('Отправлено в OrcaSlicer: '+d.pending.profile,true);$('code').value='';await load()}catch(e){say(e.message,false)}};
+$('photo').onchange=async()=>{const f=$('photo').files&&$('photo').files[0];if(!f)return;say('Распознаём QR…',true);
+ try{const d=await call('/api/decode?slot='+slot(),f,true);say('Отправлено в OrcaSlicer: '+d.pending.profile,true);await load()}catch(e){say(e.message,false)}finally{$('photo').value=''}};
+function text(tag,t){const e=document.createElement(tag);e.textContent=t;return e}
+async function load(){let d;try{d=await call('/api/status')}catch(e){if(e.status===401)showApp(false);return}
+ showApp(true);$('printer').textContent=d.printer?'Принтер: '+d.printer:'';
+ const keep=$('slot').value;$('slot').replaceChildren();(d.slots.length?d.slots:['']).forEach((name,i)=>{const o=text('option','Слот '+(i+1)+(name?' — '+name:''));o.value=i;$('slot').append(o)});if(keep)$('slot').value=keep;
+ $('queue').replaceChildren();for(const p of d.pending){const r=document.createElement('div');r.className='row';r.append(text('b',p.code+' → слот '+(p.slot+1)),text('div',p.profile),text('small',p.message||p.status));$('queue').append(r)}
+ for(const p of d.recent){const r=document.createElement('div');r.className='row';r.append(text('span','✓ '+p.profile+' → слот '+(p.slot+1)));$('queue').append(r)}
+ if(!d.pending.length&&!d.recent.length)$('queue').append(text('p','Пусто'));
+ $('spools').replaceChildren();for(const s of d.spools){const r=document.createElement('div');r.className='row';const a=text('a','Этикетка');a.href='/label/'+encodeURIComponent(s.code);a.target='_blank';
+  r.append(text('b',s.code+' · '+s.material+(s.brand?' · '+s.brand:'')),text('div',s.profile),a);$('spools').append(r)}}
+load();setInterval(()=>{if(!$('app').hidden)load()},3000);
+</script></html>'''
+
+PLUGIN_HTML = r'''<!doctype html><html lang="ru"><meta charset="utf-8"><style>
+:root{font-family:system-ui;color:var(--orca-fg,#eee);background:var(--orca-bg,#222)}body{margin:16px;max-width:1100px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:760px){.grid{grid-template-columns:1fr}}
+section{border:1px solid var(--orca-border,#666);border-radius:10px;padding:14px;margin-bottom:16px}h2{margin-top:0;font-size:18px}
+select,input,button{font:inherit;padding:7px;margin:4px 0;border-radius:6px;max-width:100%}select,input{width:100%;background:transparent;color:inherit;border:1px solid var(--orca-border,#888)}
+option{color:#000}button{background:var(--orca-accent,#4a89e8);color:var(--orca-accent-fg,#fff);border:0;cursor:pointer}button.secondary{background:transparent;color:inherit;border:1px solid var(--orca-border,#888)}
+.row{border-bottom:1px solid var(--orca-border,#555);padding:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row .grow{flex:1;min-width:200px}
+.warn{color:#e6a756}.err{color:#ff8e89}.ok{color:#8fe3a0}.muted{opacity:.75}.pin{font-size:26px;font-weight:700;letter-spacing:4px}
+#label svg{width:220px;background:#fff}code{user-select:all}
+</style><h1>🧵 Filament QR</h1><div id="banner"></div>
+<div class="grid"><section><h2>Новая катушка</h2>
+<label>Профиль филамента</label><select id="profile"></select>
+<label>Материал</label><input id="material" maxlength="40" placeholder="PLA / PETG / ABS">
+<label>Производитель, цвет</label><input id="brand" maxlength="80" placeholder="eSUN, чёрный">
+<label>Заметка</label><input id="notes" maxlength="300">
+<button id="add">Создать катушку и этикетку</button><p id="status"></p><div id="label"></div></section>
+<section><h2>Телефон</h2><div id="phone"></div>
+<label><input type="checkbox" id="lan" style="width:auto"> Разрешить доступ из локальной сети</label>
+<label>Порт</label><input id="port" type="number" min="1024" max="65535">
+<button id="applyLan" class="secondary">Применить</button> <button id="rotate" class="secondary">Новый PIN</button> <button id="revoke" class="secondary">Отключить телефоны</button>
+<p class="muted">Используйте только в доверенной домашней сети: соединение идёт по HTTP без шифрования. При первом запуске Windows может спросить разрешение брандмауэра — разрешите для частной сети.</p></section></div>
+<section><h2>Очередь сканирований</h2><div id="queue"></div></section>
+<section><h2>Катушки</h2><div id="spools"></div></section>
+<script>
+let S={};const $=id=>document.getElementById(id);
+function post(type,data){orca.postMessage(Object.assign({type},data||{}))}
+function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
+function btn(text,fn,cls){const b=el('button',text,cls);b.onclick=fn;return b}
+function slotSelect(){const s=el('select');(S.slots&&S.slots.length?S.slots:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
+$('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,notes:$('notes').value});
+$('applyLan').onclick=()=>post('set_lan',{enabled:$('lan').checked,port:parseInt($('port').value,10)});
+$('rotate').onclick=()=>post('rotate_pin');$('revoke').onclick=()=>post('revoke_sessions');
+const STATUS={queued:'в очереди',manual:'выберите вручную',needs_attention:'нужно внимание',cancelled:'отменено'};
+function render(s){S=s;
+ const b=$('banner');b.replaceChildren();
+ if(!s.available)b.append(el('p','Хранилище плагина недоступно: эта версия OrcaSlicer не поддерживает plugin API v1. Установите сборку OrcaSlicer-AI.','err'));
+ else if(s.mode!=='automatic')b.append(el('p','Режим без автоматического выбора: после сканирования выберите показанный профиль в слоте вручную.','warn'));
+ b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slots||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
+ const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;
+ if(!s.available)return;
+ const ph=$('phone');ph.replaceChildren();
+ if(s.server_error)ph.append(el('p',s.server_error,'err'));
+ for(const u of s.urls||[]){const p=el('p','Адрес: ');p.append(el('code',u));ph.append(p)}
+ if(!s.lan_enabled)ph.append(el('p','Сейчас доступ только с этого компьютера. Включите доступ из сети, чтобы сканировать телефоном.','warn'));
+ const pin=el('p','PIN: ');pin.append(el('span',s.pin,'pin'));ph.append(pin);ph.append(el('p','Подключённых телефонов: '+s.sessions,'muted'));
+ if(document.activeElement!==$('port'))$('port').value=s.port;if(document.activeElement!==$('lan'))$('lan').checked=s.lan_enabled;
+ const q=$('queue');q.replaceChildren();
+ for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');t.append(el('b',p.code+' → слот '+(p.slot+1)+': '+p.profile));t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
+  r.append(t,btn('Повторить',()=>post('retry',{id:p.id})),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));q.append(r)}
+ for(const p of s.recent){q.append(el('div','✓ '+p.profile+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
+ if(!s.pending.length&&!s.recent.length)q.append(el('p','Пусто','muted'));
+ const sp=$('spools');sp.replaceChildren();
+ for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');t.append(el('b',item.code+' · '+item.material+(item.brand?' · '+item.brand:'')));t.append(el('div',item.profile,'muted'));
+  const sel=slotSelect();r.append(t,sel,btn('Выбрать',()=>post('use',{code:item.code,slot:parseInt(sel.value,10)})),btn('Этикетка',()=>post('label',{code:item.code}),'secondary'),
+  btn('Удалить',()=>{if(confirm('Удалить катушку '+item.code+'?'))post('delete',{code:item.code})},'secondary'));sp.append(r)}
+ if(!s.spools.length)sp.append(el('p','Катушек пока нет','muted'))}
+orca.onMessage(d=>{if(d.type==='state')render(d.state);
+ else if(d.type==='label'){$('label').innerHTML=d.svg;const u=(S.urls&&S.urls.length)?'http://127.0.0.1:'+S.port+'/label/'+d.code:'';$('status').textContent=u?'Печать этикетки: откройте '+u+' в браузере':'';$('status').className='muted'}
+ else if(d.type==='created'){$('status').textContent='Создана катушка '+d.spool.code;$('status').className='ok'}
+ else if(d.type==='error'){$('status').textContent='Ошибка: '+d.message;$('status').className='err'}});
+post('tick');setInterval(()=>post('tick'),1500);
+</script></html>'''
+
+
+if orca is not None:
+    class FilamentQRPage(orca.pages.PagesPluginCapabilityBase):
+        controller = None
+
+        def get_name(self):
+            return 'Filament QR'
+
+        def get_ui(self):
+            return PLUGIN_HTML
+
+        def on_load(self):
+            caps = HostCapabilities.discover(orca)
+            data_dir = None
+            if caps.storage:
+                try:
+                    data_dir = orca.host.v1.plugin_storage()
+                except Exception:
+                    data_dir = None
+            self.controller = Controller(orca.host, caps, data_dir)
+            self.controller.start_server()
+
+        def on_unload(self):
+            controller, self.controller = self.controller, None
+            if controller is not None:
+                controller.shutdown()
+
+        def on_message(self, data):
+            if self.controller is None:
+                return
+            try:
+                messages = self.controller.handle(data)
+            except (ValueError, LookupError, RuntimeError, sqlite3.Error) as exc:
+                messages = [{'type': 'error', 'message': str(exc)}]
+            for message in messages:
+                self.post_message(message)
+
+    @orca.plugin
+    class FilamentQRPlugin(orca.base):
+        def register_capabilities(self):
+            orca.register_capability(FilamentQRPage)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Run the Filament QR phone server without OrcaSlicer')
+    parser.add_argument('--data', required=True, help='directory for the spool database')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT)
+    parser.add_argument('--lan', action='store_true', help='listen on all interfaces (trusted LAN only)')
+    args = parser.parse_args()
+    service = Service(Store(Path(args.data) / 'filament_qr.sqlite3'))
+    service.set_workspace(WorkspaceState(printer='Demo printer', slots=['Generic PLA'], profiles=['Generic PLA']))
+    server = FilamentHttpServer(service)
+    host_addr = server.start('0.0.0.0' if args.lan else '127.0.0.1', args.port)
+    print(f'http://{host_addr[0]}:{host_addr[1]}/  PIN {service.sessions.pin}', flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
