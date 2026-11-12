@@ -1,0 +1,40 @@
+{
+  "manifest_version": 1,
+  "host": {
+    "product": "OrcaSlicer",
+    "tag": "v2.5.0",
+    "commit": "40ecc66f78ed72dc368e0c1ebe40d77f00cc8a19",
+    "required_api": [
+      "orca.host.preset",
+      "orca.host.plugin.storage",
+      "orca.host.ui.message",
+      "orca.request_permissions"
+    ]
+  },
+  "plugins": [
+    {
+      "id": "ai_assist",
+      "file": "plugins/ai_assist/orca_ai_assist.py",
+      "version": "1.1.0",
+      "min_host": "2.5.0",
+      "sha256": "2f9e3dc94b2b5afbdf75d93c410863364aa1409b0cd672716308cea89f679b7b",
+      "platforms": {
+        "windows-x64": "not-tested",
+        "linux-x64": "not-tested",
+        "macos-arm64": "not-tested"
+      }
+    },
+    {
+      "id": "filament_qr",
+      "file": "plugins/filament_qr/orca_filament_qr.py",
+      "version": "1.1.0",
+      "min_host": "2.5.0",
+      "sha256": "7196ea33525af28563de2ee1d11e9ef7cd71354ff2b899e88e2d53c12721728c",
+      "platforms": {
+        "windows-x64": "not-tested",
+        "linux-x64": "not-tested",
+        "macos-arm64": "not-tested"
+      }
+    }
+  ]
+}
