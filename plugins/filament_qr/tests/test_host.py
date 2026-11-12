@@ -1,109 +1,138 @@
+import threading
 import types
 
-from tests.helpers import FEATURES, TempDirTest, automatic_host, fq, legacy_host
+from tests.helpers import TempDirTest, automatic_host, fq, legacy_host
+
+
+def in_worker(fn, *args):
+    """Run fn on a non-UI thread, as the controller does, and return its result."""
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault('value', fn(*args)))
+    worker.start()
+    worker.join(5)
+    return result['value']
 
 
 class DiscoveryTest(TempDirTest):
-    def test_full_v1_host_is_automatic(self):
-        caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=automatic_host(self.tmp)))
+    def discover(self, host):
+        return fq.HostCapabilities.discover(types.SimpleNamespace(host=host))
+
+    def test_caps_upstream_automatic(self):
+        caps = self.discover(automatic_host(self.tmp))
         self.assertEqual(caps.mode, 'automatic')
         self.assertTrue(caps.storage)
 
-    def test_official_host_without_api_info_is_manual(self):
-        caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=legacy_host()))
+    def test_caps_bundle_only_manual(self):
+        caps = self.discover(legacy_host())
         self.assertEqual(caps.mode, 'manual')
         self.assertFalse(caps.storage)
 
-    def test_raising_api_info_is_manual(self):
-        host = automatic_host(self.tmp)
-        host.api_info = lambda: (_ for _ in ()).throw(RuntimeError('boom'))
-        self.assertEqual(fq.HostCapabilities.discover(types.SimpleNamespace(host=host)).mode, 'manual')
-
-    def test_partial_features_are_manual(self):
-        host = automatic_host(self.tmp)
-        host.api_info = lambda: {'features': [f for f in FEATURES if f != 'preset_select.v1']}
-        caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=host))
+    def test_caps_v1_only_is_manual_without_storage(self):
+        host = legacy_host()
+        host.api_info = lambda: {'features': ['plugin_storage.v1', 'preset_select.v1']}
+        host.v1 = types.SimpleNamespace(plugin_storage=lambda: str(self.tmp),
+                                        presets=types.SimpleNamespace(snapshot=dict, commit=dict))
+        caps = self.discover(host)
         self.assertEqual(caps.mode, 'manual')
-        self.assertTrue(caps.storage)
+        self.assertFalse(caps.storage)
+
+    def test_no_host(self):
+        caps = fq.HostCapabilities.discover(types.SimpleNamespace())
+        self.assertEqual((caps.mode, caps.storage), ('manual', False))
 
 
-class AttemptTest(TempDirTest):
+class WorkspaceTest(TempDirTest):
+    def test_reads_slots_and_compatible_profiles(self):
+        ws = fq.read_workspace(automatic_host(self.tmp, slots=['Generic PLA', 'Generic PETG']), None)
+        self.assertEqual(ws.printer, 'Printer A')
+        self.assertEqual(ws.slots, ['Generic PLA', 'Generic PETG'])
+        self.assertEqual(ws.profiles, ['Generic PLA', 'Generic PETG'])
+
+
+class PrepareTest(TempDirTest):
     def setUp(self):
         super().setUp()
         self.store = fq.Store(self.tmp / 'db.sqlite3')
         self.host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'])
-        self.presets = self.host.v1.presets
         self.caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=self.host))
 
-    def enqueue(self, profile, slot):
+    def prepare(self, profile, slot, host=None, caps=None):
         spool = self.store.add_spool(profile, 'Printer A', 'X')
-        return self.store.enqueue_scan(spool['code'], slot)
-
-    def attempt(self, pending):
-        status = fq.attempt_pending(self.host, self.store, self.store.get_pending(pending['id']), self.caps)
+        pending = self.store.enqueue_scan(spool['code'], slot)
+        status = fq.prepare_pending(host or self.host, self.store, self.store.get_pending(pending['id']),
+                                    caps or self.caps)
         return status, self.store.get_pending(pending['id'])
 
-    def test_applied_selection_completes_the_scan(self):
-        status, row = self.attempt(self.enqueue('Generic PETG', 1))
-        self.assertEqual(status, 'done')
-        self.assertEqual(self.presets.slots, ['Generic PLA', 'Generic PETG'])
-        [request] = self.presets.commits
-        self.assertEqual(request['interaction'], 'require_user_confirmation')
-        self.assertEqual(request['expected_revision'], 'rev-0')
-        self.assertEqual(request['operations'],
-                         [{'op': 'select', 'preset_type': 'filament', 'name': 'Generic PETG', 'scope': {'slot': 1}}])
-        self.assertEqual(row['host_revision'], 'rev-1')
+    def test_needs_selection_stays_queued(self):
+        status, row = self.prepare('Generic PETG', 1)
+        self.assertEqual(status, 'select')
+        self.assertEqual(row['status'], 'queued')
+        self.assertEqual(self.host.begins, [])
 
-    def test_already_active_profile_needs_no_commit(self):
-        status, _ = self.attempt(self.enqueue('Generic PLA', 0))
-        self.assertEqual(status, 'done')
-        self.assertEqual(self.presets.commits, [])
-
-    def test_cancel_keeps_scan_retryable(self):
-        self.presets.answer = 'cancel'
-        pending = self.enqueue('Generic PETG', 0)
-        status, row = self.attempt(pending)
-        self.assertEqual(status, 'cancelled')
-        self.assertIn(row['id'], [p['id'] for p in self.store.list_pending()])
-
-        self.presets.answer = 'confirm'
-        self.store.mark(pending['id'], 'queued')
-        reopened = fq.Store(self.tmp / 'db.sqlite3')
-        status = fq.attempt_pending(self.host, reopened, reopened.get_pending(pending['id']), self.caps)
-        self.assertEqual(status, 'done')
-        self.assertEqual(self.presets.slots[0], 'Generic PETG')
-
-    def test_conflict_requeues_with_a_fresh_revision_then_gives_up(self):
-        pending = self.enqueue('Generic PETG', 0)
-        self.presets.forced_result = {'status': 'conflict', 'affected': [], 'diagnostics': []}
-        statuses = [self.attempt(pending)[0] for _ in range(fq.MAX_AUTO_ATTEMPTS)]
-        self.assertEqual(statuses[:-1], ['queued'] * (fq.MAX_AUTO_ATTEMPTS - 1))
-        self.assertEqual(statuses[-1], 'needs_attention')
-
-    def test_mismatched_applied_result_does_not_complete(self):
-        pending = self.enqueue('Generic PETG', 1)
-        self.presets.forced_result = {'status': 'applied', 'revision': 'x',
-                                      'affected': [{'op': 'select', 'slot': 0, 'name': 'Generic PETG'}]}
-        status, row = self.attempt(pending)
-        self.assertEqual(status, 'needs_attention')
-        self.assertEqual(row['status'], 'needs_attention')
+    def test_already_active_profile_is_done(self):
+        status, row = self.prepare('Generic PLA', 0)
+        self.assertEqual((status, row['status']), ('done', 'done'))
 
     def test_missing_slot_and_incompatible_profile_need_attention(self):
-        self.assertEqual(self.attempt(self.enqueue('Generic PETG', 5))[0], 'needs_attention')
-        self.assertEqual(self.attempt(self.enqueue('Other ABS', 0))[0], 'needs_attention')
-        self.assertEqual(self.presets.commits, [])
+        self.assertEqual(self.prepare('Generic PETG', 5)[0], 'needs_attention')
+        self.assertEqual(self.prepare('Other ABS', 0)[0], 'needs_attention')
+        self.assertEqual(self.host.begins, [])
 
-    def test_host_failures_are_reported(self):
-        for status in ('invalid', 'unsupported', 'error', 'not_found', 'incompatible', 'invalid_slot'):
-            self.presets.forced_result = {'status': status, 'message': 'detail'}
-            result, row = self.attempt(self.enqueue('Generic PETG', 0))
-            self.assertEqual(result, 'needs_attention')
-            self.assertIn('detail', row['message'])
-
-    def test_manual_mode_never_commits(self):
+    def test_manual_mode_asks_user(self):
         host = legacy_host(slots=['Generic PLA'])
         caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=host))
-        pending = self.enqueue('Generic PETG', 0)
-        status = fq.attempt_pending(host, self.store, self.store.get_pending(pending['id']), caps)
+        status, row = self.prepare('Generic PETG', 0, host, caps)
         self.assertEqual(status, 'manual')
-        self.assertIn('слоте 1', self.store.get_pending(pending['id'])['message'])
+        self.assertIn('слоте 1', row['message'])
+
+
+class SelectTest(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'])
+
+    def select(self, slot=1, profile='Generic PETG'):
+        return in_worker(fq.select_in_slot, self.host, slot, profile)
+
+    def test_confirmed_selection_uses_one_based_slot(self):
+        status, _ = self.select()
+        self.assertEqual(status, 'done')
+        self.assertEqual(self.host.begins, [(2, 'Generic PETG')])
+        self.assertEqual(self.host.commits, [2])
+        self.assertEqual(self.host.slots, ['Generic PLA', 'Generic PETG'])
+        text, buttons = self.host.dialogs[0]
+        self.assertEqual(buttons, 'yes_no')
+        self.assertIn('Generic PETG', text)
+        self.assertIn('слот 2', text)
+
+    def test_select_declined_marks_cancelled(self):
+        self.host.answer = 'no'
+        self.assertEqual(self.select()[0], 'cancelled')
+        self.assertEqual(self.host.begins, [])
+
+    def test_select_cancelled_prompt_marks_cancelled(self):
+        self.host.begin_error = RuntimeError('cancelled')
+        self.assertEqual(self.select()[0], 'cancelled')
+        self.assertEqual(self.host.commits, [])
+
+    def test_select_value_error_marks_needs_attention(self):
+        self.host.begin_error = ValueError('Filament preset "Generic PETG" is not offered by slot 2')
+        status, message = self.select()
+        self.assertEqual(status, 'needs_attention')
+        self.assertIn('not offered', message)
+
+    def test_changed_slot_mapping_needs_attention(self):
+        self.host.commit_error = RuntimeError('Filament slot 2 now holds "X"')
+        status, message = self.select()
+        self.assertEqual(status, 'needs_attention')
+        self.assertIn('изменилось', message)
+
+    def test_other_target_needs_attention(self):
+        self.host.target_override = 'Something else'
+        self.assertEqual(self.select()[0], 'needs_attention')
+
+    def test_permission_error_is_explained(self):
+        self.host.begin_error = PermissionError('denied')
+        status, message = self.select()
+        self.assertEqual(status, 'needs_attention')
+        self.assertIn('«Плагины»', message)

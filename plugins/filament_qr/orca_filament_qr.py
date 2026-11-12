@@ -6,20 +6,21 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.0.0"
+# version = "1.1.0"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
 Each spool gets a short code (FQ-XXXXXX) bound to an OrcaSlicer filament
 profile. Scanning a label with a phone on the local network queues a request
 "put this profile into filament slot N". The queue lives in SQLite and survives
-restarts. On a host with the plugin API v1 the plugin asks OrcaSlicer to select
-the profile (OrcaSlicer shows its own confirmation dialog); on an official
-host it only tells the user which profile to pick by hand.
+restarts. On OrcaSlicer 2.5.0+ the plugin asks for a native confirmation and
+selects the profile through the preset API; on older hosts it only tells the
+user which profile to pick by hand.
 
 Threading: the LAN server threads only touch the store and the in-memory
-session table. Every orca.host call happens in Pages callbacks on the GUI
-thread.
+session table. Preset reads happen in Pages callbacks on the GUI thread; the
+selection itself (begin_update/commit, which must not run on the GUI thread)
+runs on one plugin-owned worker at a time.
 """
 import hashlib
 import io
@@ -60,7 +61,8 @@ REQUEST_TIMEOUT = 10.0
 CODE_RE = re.compile(r'^FQ-[0-9A-F]{6}$')
 
 ACTIVE_STATUSES = ('queued', 'manual', 'needs_attention', 'cancelled')
-MAX_AUTO_ATTEMPTS = 3
+SELECT_JOIN_TIMEOUT = 3.0
+PERMISSION_TEXT = 'OrcaSlicer заблокировал сетевой доступ плагина: разрешите его в окне «Плагины»'
 
 
 def utc_now():
@@ -410,30 +412,18 @@ def decode_qr_image(data):
 
 # --------------------------------------------------------------------------- OrcaSlicer host
 
-AUTOMATIC_FEATURES = frozenset({'preset_snapshot.v1', 'preset_transaction.v1', 'preset_select.v1'})
-
-
 @dataclass
 class HostCapabilities:
     mode: str                      # 'automatic' | 'manual'
     storage: bool
-    features: frozenset = frozenset()
 
     @classmethod
     def discover(cls, orca_module):
         host = getattr(orca_module, 'host', None)
-        features = frozenset()
-        try:
-            info = host.api_info()
-            features = frozenset(str(f) for f in info.get('features', ()))
-        except Exception:
-            pass
-        v1 = getattr(host, 'v1', None)
-        storage = 'plugin_storage.v1' in features and callable(getattr(v1, 'plugin_storage', None))
-        presets = getattr(v1, 'presets', None)
-        automatic = (AUTOMATIC_FEATURES <= features and callable(getattr(presets, 'snapshot', None))
-                     and callable(getattr(presets, 'commit', None)))
-        return cls('automatic' if automatic else 'manual', storage, features)
+        editor = getattr(getattr(host, 'preset', None), 'filament', None)
+        automatic = callable(getattr(host, 'preset_bundle', None)) and callable(getattr(editor, 'begin_update', None))
+        storage = callable(getattr(getattr(host, 'plugin', None), 'storage', None))
+        return cls('automatic' if automatic else 'manual', storage)
 
 
 @dataclass
@@ -441,22 +431,11 @@ class WorkspaceState:
     printer: str = ''
     slots: list = field(default_factory=list)      # preset name per zero-based slot
     profiles: list = field(default_factory=list)   # compatible, visible filament presets
-    revision: str = ''
     dirty: bool = False
 
 
 def read_workspace(host, caps):
     """Read printer, filament slots and compatible profiles. GUI thread only."""
-    if caps.mode == 'automatic':
-        snap = host.v1.presets.snapshot()
-        profiles = [p['name'] for p in snap.get('resources', {}).get('filament', ())
-                    if p.get('visible') and p.get('compatible')]
-        return WorkspaceState(
-            printer=str(snap.get('active_printer', {}).get('name', '')),
-            slots=[str(s.get('preset_name', '')) for s in snap.get('filament_slots', ())],
-            profiles=profiles,
-            revision=str(snap.get('revision', '')),
-            dirty=bool(snap.get('presets_dirty')))
     bundle = host.preset_bundle()
     filaments = bundle.filaments
     profiles = []
@@ -471,19 +450,12 @@ def read_workspace(host, caps):
                           dirty=bool(edited.is_dirty) if edited else False)
 
 
-RESULT_MESSAGES = {
-    'cancelled': 'Отменено в OrcaSlicer — можно повторить',
-    'invalid_slot': 'Такого слота филамента нет у текущего принтера',
-    'not_found': 'Профиль филамента не найден в OrcaSlicer',
-    'incompatible': 'Профиль не совместим с текущим принтером',
-    'invalid': 'OrcaSlicer отклонил запрос',
-    'unsupported': 'OrcaSlicer сейчас не может выполнить выбор',
-    'error': 'Ошибка OrcaSlicer при выборе профиля',
-}
+CANCELLED_TEXT = 'Отменено в OrcaSlicer — можно повторить'
 
 
-def attempt_pending(host, store, pending, caps):
-    """Try to put pending['profile'] into pending['slot']. GUI thread only. Returns the new status."""
+def prepare_pending(host, store, pending, caps):
+    """Check a queued scan on the GUI thread. Returns 'select' when OrcaSlicer must select the profile
+    (the scan stays queued), otherwise the status it was marked with."""
     pid, slot, profile = pending['id'], int(pending['slot']), pending['profile']
     try:
         ws = read_workspace(host, caps)
@@ -495,7 +467,7 @@ def attempt_pending(host, store, pending, caps):
         store.mark(pid, 'needs_attention', f'У принтера нет слота {slot + 1}')
         return 'needs_attention'
     if ws.slots[slot] == profile:
-        store.mark(pid, 'done', 'Профиль уже выбран', host_revision=ws.revision)
+        store.mark(pid, 'done', 'Профиль уже выбран')
         return 'done'
     if profile not in ws.profiles:
         store.mark(pid, 'needs_attention', 'Профиль отсутствует или не совместим с текущим принтером')
@@ -503,36 +475,30 @@ def attempt_pending(host, store, pending, caps):
     if caps.mode != 'automatic':
         store.mark(pid, 'manual', f'Выберите «{profile}» в слоте {slot + 1} вручную')
         return 'manual'
+    return 'select'
 
-    request = {'expected_revision': ws.revision, 'interaction': 'require_user_confirmation',
-               'operations': [{'op': 'select', 'preset_type': 'filament', 'name': profile,
-                               'scope': {'slot': slot}}]}
+
+def select_in_slot(host, slot, profile):
+    """Confirm and select profile into zero-based slot. Must not run on the GUI thread.
+    Returns (status, message) for the store."""
+    question = f'Выбрать профиль «{profile}» в слот {slot + 1}?\n\nЗапрос пришёл со сканера Filament QR.'
+    if host.ui.message(question, title='Filament QR', buttons='yes_no', icon='question') != 'yes':
+        return 'cancelled', CANCELLED_TEXT
     try:
-        result = host.v1.presets.commit(request)
-    except Exception as exc:
-        store.mark(pid, 'needs_attention', f'Ошибка вызова OrcaSlicer: {exc}', attempted=True)
-        return 'needs_attention'
-
-    status = result.get('status')
-    if status == 'applied':
-        changed = [a for a in result.get('affected', ()) if a.get('op') == 'select']
-        if any(a.get('slot') == slot and a.get('name') == profile for a in changed) or not changed:
-            store.mark(pid, 'done', 'Профиль выбран', attempted=True, host_revision=result.get('revision', ''))
-            return 'done'
-        store.mark(pid, 'needs_attention', 'OrcaSlicer применил другое изменение', attempted=True)
-        return 'needs_attention'
-    if status == 'conflict':
-        if pending.get('attempts', 0) + 1 < MAX_AUTO_ATTEMPTS:
-            store.mark(pid, 'queued', 'Состояние OrcaSlicer изменилось, повтор', attempted=True)
-            return 'queued'
-        store.mark(pid, 'needs_attention', 'Состояние OrcaSlicer постоянно меняется', attempted=True)
-        return 'needs_attention'
-    message = RESULT_MESSAGES.get(status, 'Неизвестный ответ OrcaSlicer')
-    if result.get('message'):
-        message += f' ({result["message"]})'
-    new_status = 'cancelled' if status == 'cancelled' else 'needs_attention'
-    store.mark(pid, new_status, message, attempted=True)
-    return new_status
+        transaction = host.preset.filament.begin_update(slot + 1, profile)
+    except RuntimeError:
+        return 'cancelled', CANCELLED_TEXT
+    except ValueError as exc:
+        return 'needs_attention', f'OrcaSlicer не может выбрать профиль: {exc}'
+    except PermissionError:
+        return 'needs_attention', PERMISSION_TEXT
+    try:
+        transaction.commit()
+    except (RuntimeError, ValueError):
+        return 'needs_attention', 'Состояние OrcaSlicer изменилось во время выбора — повторите'
+    if transaction.target_name != profile:
+        return 'needs_attention', 'OrcaSlicer выбрал другой профиль'
+    return 'done', 'Профиль выбран'
 
 
 # --------------------------------------------------------------------------- shared service state
@@ -782,6 +748,9 @@ class FilamentHttpServer:
         self.stop()
         try:
             self._server = _BoundedServer((bind, int(port)), _Handler, self.service)
+        except PermissionError as exc:
+            self._server = None
+            raise RuntimeError(PERMISSION_TEXT) from exc
         except OSError as exc:
             self._server = None
             raise RuntimeError(f'Не удалось открыть порт {port}: {exc.strerror or exc}') from exc
@@ -802,18 +771,16 @@ class FilamentHttpServer:
 
 
 def lan_addresses():
-    try:
-        addrs = {a for a in socket.gethostbyname_ex(socket.gethostname())[2]
-                 if not a.startswith(('127.', '169.254.'))}
-    except OSError:
-        addrs = set()
+    # Only the outgoing-interface probe: resolving the host name would make OrcaSlicer ask for a
+    # permission on a target that cannot be declared in advance.
+    addrs = set()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect(('192.0.2.1', 9))  # no packet is sent for UDP connect
             addrs.add(probe.getsockname()[0])
     except OSError:
         pass
-    return sorted(a for a in addrs if not a.startswith('127.'))
+    return sorted(a for a in addrs if not a.startswith(('127.', '169.254.')))
 
 
 # --------------------------------------------------------------------------- settings
@@ -858,7 +825,9 @@ class Controller:
         self.store = self.settings = self.service = self.server = None
         self.server_error = ''
         self.hosts = ['127.0.0.1']
-        self.busy = False
+        self._lock = threading.Lock()
+        self._closed = False
+        self._selecting = None
         if self.data_dir is not None:
             self.store = Store(self.data_dir / 'filament_qr.sqlite3')
             self.settings = Settings(self.data_dir / 'settings.json')
@@ -881,6 +850,11 @@ class Controller:
             self.server_error = str(exc)
 
     def shutdown(self):
+        with self._lock:
+            self._closed = True
+            worker = self._selecting
+        if worker is not None:
+            worker.join(SELECT_JOIN_TIMEOUT)
         if self.server:
             self.server.stop()
         if self.service:
@@ -896,29 +870,44 @@ class Controller:
         return ws
 
     def process_queue(self):
-        """Handle queued scans one by one. Re-entrant calls (from the confirmation dialog's event loop) are no-ops.
-        Returns True when the workspace may have changed."""
-        if not self.available or self.busy:
+        """Handle queued scans on the GUI thread; at most one selection runs at a time on a worker.
+        Returns True when the queue or workspace may have changed."""
+        if not self.available or self._closed:
             return False
-        self.busy = True
+        if self._selecting is not None and self._selecting.is_alive():
+            return False
         changed = False
-        try:
-            self.service.queue_changed.clear()
-            for _ in range(10):
-                pending = self.store.next_queued()
-                if pending is None:
-                    break
-                attempt_pending(self.host, self.store, pending, self.caps)
-                changed = True
-            if self.caps.mode != 'automatic':
-                ws = self.service.workspace()
-                for pending in self.store.list_pending(('manual',)):
-                    slot = int(pending['slot'])
-                    if slot < len(ws.slots) and ws.slots[slot] == pending['profile']:
-                        self.store.mark(pending['id'], 'done', 'Профиль выбран')
-        finally:
-            self.busy = False
+        self.service.queue_changed.clear()
+        for _ in range(10):
+            pending = self.store.next_queued()
+            if pending is None:
+                break
+            changed = True
+            if prepare_pending(self.host, self.store, pending, self.caps) == 'select':
+                self._start_selection(pending)
+                break
+        if self.caps.mode != 'automatic':
+            ws = self.service.workspace()
+            for pending in self.store.list_pending(('manual',)):
+                slot = int(pending['slot'])
+                if slot < len(ws.slots) and ws.slots[slot] == pending['profile']:
+                    self.store.mark(pending['id'], 'done', 'Профиль выбран')
         return changed
+
+    def _start_selection(self, pending):
+        pid, slot, profile = pending['id'], int(pending['slot']), pending['profile']
+
+        def run():
+            try:
+                status, message = select_in_slot(self.host, slot, profile)
+            except Exception as exc:
+                status, message = 'needs_attention', f'Ошибка OrcaSlicer при выборе профиля: {exc}'
+            with self._lock:
+                if not self._closed:
+                    self.store.mark(pid, status, message, attempted=True)
+
+        self._selecting = threading.Thread(target=run, name='filament-qr-select', daemon=True)
+        self._selecting.start()
 
     def state(self, ws=None):
         ws = ws or self.refresh_workspace()
@@ -943,6 +932,8 @@ class Controller:
 
     def handle(self, data):
         """Handle one page message; returns the messages to post back."""
+        if self._closed:
+            return []
         kind = data.get('type') if isinstance(data, dict) else None
         if kind == 'tick':
             ws = self.refresh_workspace()
@@ -950,7 +941,7 @@ class Controller:
                 ws = None
             return [{'type': 'state', 'state': self.state(ws)}]
         if not self.available:
-            return [{'type': 'error', 'message': 'Хранилище плагина недоступно: нужна сборка OrcaSlicer с plugin API v1'}]
+            return [{'type': 'error', 'message': 'Хранилище плагина недоступно: нужен OrcaSlicer 2.5.0 или новее'}]
         out = []
         if kind == 'create':
             ws = self.refresh_workspace()
@@ -1076,7 +1067,7 @@ $('rotate').onclick=()=>post('rotate_pin');$('revoke').onclick=()=>post('revoke_
 const STATUS={queued:'в очереди',manual:'выберите вручную',needs_attention:'нужно внимание',cancelled:'отменено'};
 function render(s){S=s;
  const b=$('banner');b.replaceChildren();
- if(!s.available)b.append(el('p','Хранилище плагина недоступно: эта версия OrcaSlicer не поддерживает plugin API v1. Установите сборку OrcaSlicer-AI.','err'));
+ if(!s.available)b.append(el('p','Хранилище плагина недоступно: нужен OrcaSlicer 2.5.0 или новее.','err'));
  else if(s.mode!=='automatic')b.append(el('p','Режим без автоматического выбора: после сканирования выберите показанный профиль в слоте вручную.','warn'));
  b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slots||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
  const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;
@@ -1120,7 +1111,7 @@ if orca is not None:
             data_dir = None
             if caps.storage:
                 try:
-                    data_dir = orca.host.v1.plugin_storage()
+                    data_dir = orca.host.plugin.storage()
                 except Exception:
                     data_dir = None
             self.controller = Controller(orca.host, caps, data_dir)
@@ -1144,6 +1135,8 @@ if orca is not None:
     @orca.plugin
     class FilamentQRPlugin(orca.base):
         def register_capabilities(self):
+            if callable(getattr(orca, 'request_permissions', None)):
+                orca.request_permissions(network_socket=['127.0.0.1', '0.0.0.0', '192.0.2.1'], threading=True)
             orca.register_capability(FilamentQRPage)
 
 
