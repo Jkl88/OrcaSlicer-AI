@@ -382,8 +382,6 @@ TEST_CASE("Preset value staging rolls back on apply failure", "[PluginHost]")
     }
 }
 
-<<<<<<< HEAD
-=======
 TEST_CASE("Filament selection validates slot bounds", "[PluginHost]")
 {
     Slic3r::PresetBundle bundle;
@@ -434,7 +432,6 @@ TEST_CASE("Filament selection applies valid changes", "[PluginHost]")
     CHECK(bundle.filament_presets[0] == "Generic PLA");
 }
 
->>>>>>> worktree-plugin-host-api
 TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][Python]")
 {
     py::object host = import_orca_module().attr("host");
@@ -456,8 +453,6 @@ TEST_CASE("Plugin host API advertises stable versioned features", "[PluginHost][
     CHECK(features[4].cast<std::string>() == "preset_values.v1");
     CHECK(has_attr(host, "v1"));
 }
-<<<<<<< HEAD
-=======
 
 TEST_CASE("Plugin host API v1 surfaces are callable", "[PluginHost][Python]")
 {
@@ -505,4 +500,3 @@ TEST_CASE("Plugin host API returns structured errors without native exceptions",
     REQUIRE(unsupported_dict.contains("status"));
     CHECK(unsupported_dict["status"].cast<std::string>() == "unsupported");
 }
->>>>>>> worktree-plugin-host-api

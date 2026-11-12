@@ -24,8 +24,9 @@ endif ()
 orcaslicer_add_cmake_project(
     wxWidgets
     GIT_REPOSITORY "https://github.com/SoftFever/Orca-deps-wxWidgets"
-    GIT_TAG v3.3.2
-    GIT_SHALLOW ON
+    # Pinned: later v3.3.2 branch commits already change wxWidgetsConfig.cmake.in, so the patch no longer applies.
+    GIT_TAG db1005db3dea2c37a46fb455a9a02e37aa360751
+    GIT_SHALLOW OFF
     GIT_SUBMODULES 3rdparty/catch 3rdparty/pcre 3rdparty/libwebp
     DEPENDS ${PNG_PKG} ${ZLIB_PKG} ${EXPAT_PKG} ${JPEG_PKG}
     PATCH_COMMAND git apply --verbose --ignore-space-change --whitespace=fix ${CMAKE_CURRENT_LIST_DIR}/0001-Clang-CL-fix.patch
