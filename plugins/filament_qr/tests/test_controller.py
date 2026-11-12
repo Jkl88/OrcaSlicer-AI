@@ -1,9 +1,12 @@
 import importlib.util
 import sys
+import unittest
 import threading
 import time
 import types
 from unittest import mock
+
+HAVE_QRCODE = importlib.util.find_spec('qrcode') is not None
 
 from tests.helpers import PLUGIN_PATH, TempDirTest, automatic_host, fq, install_fake_orca, legacy_host, settle
 
@@ -45,6 +48,18 @@ class ControllerTest(TempDirTest):
         settle(controller)
         self.assertEqual(host.state['colours'][1], '#00AA00')
         self.assertEqual(host.slots[1], 'Generic PETG')
+
+    @unittest.skipUnless(HAVE_QRCODE, 'qrcode is required')
+    def test_state_has_scannable_server_addresses(self):
+        controller, _ = self.make()
+        controller.start_server()
+        state = controller.handle({'type': 'tick'})[-1]['state']
+        self.assertTrue(state['urls'])
+        self.assertEqual([q['url'] for q in state['url_qrs']], state['urls'])
+        for item in state['url_qrs']:
+            self.assertTrue(item['svg'].startswith('<svg'))
+            self.assertIn('viewBox', item['svg'])
+        self.assertIs(controller.url_qrs(state['urls']), controller.url_qrs(list(state['urls'])))
 
     def test_state_reports_decoder_problem(self):
         controller, _ = self.make()

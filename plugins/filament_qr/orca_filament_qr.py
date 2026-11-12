@@ -6,7 +6,7 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.2.0"
+# version = "1.3.0"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
@@ -137,6 +137,23 @@ def qr_svg(spool):
         f'<text x="28" y="67.2" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.15" '
         f'fill="#333">{escape(title[:34])}</text>'
         '</svg>')
+
+
+def url_qr_svg(url):
+    """Square QR code of a server address for the phone camera."""
+    import qrcode
+    from qrcode.constants import ERROR_CORRECT_M
+
+    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, border=2, box_size=1)
+    qr.add_data(url)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    size = len(matrix)
+    rects = ''.join(f'<rect x="{ix}" y="{iy}" width="1.02" height="1.02"/>'
+                    for iy, row in enumerate(matrix) for ix, dark in enumerate(row) if dark)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 {size} {size}" '
+            f'shape-rendering="crispEdges"><rect width="{size}" height="{size}" fill="white"/>'
+            f'<g fill="#111">{rects}</g></svg>')
 
 
 def label_page(spool):
@@ -897,6 +914,7 @@ class Controller:
         self._lock = threading.Lock()
         self._closed = False
         self._selecting = None
+        self._url_qrs = ((), [])
         # Imported here, on the GUI thread during on_load, so request threads reuse the loaded modules.
         self.decoder_error = decoder_error()
         if self.data_dir is not None:
@@ -982,6 +1000,17 @@ class Controller:
         self._selecting = threading.Thread(target=run, name='filament-qr-select', daemon=True)
         self._selecting.start()
 
+    def url_qrs(self, urls):
+        """QR codes of the server addresses, rebuilt only when the address list changes."""
+        key = tuple(urls)
+        if self._url_qrs[0] != key:
+            try:
+                codes = [{'url': url, 'svg': url_qr_svg(url)} for url in key]
+            except ImportError:
+                codes = []
+            self._url_qrs = (key, codes)
+        return self._url_qrs[1]
+
     def state(self, ws=None):
         ws = ws or self.refresh_workspace()
         base = {'mode': self.caps.mode, 'available': self.available, 'printer': ws.printer, 'slots': ws.slots,
@@ -991,13 +1020,15 @@ class Controller:
             return base
         address = self.server.address
         port = address[1] if address else self.settings.port
+        urls = [f'http://{h}:{port}/' for h in self.hosts] if address else []
         base.update({
             'spools': self.store.list_spools(),
             'pending': self.store.list_pending(),
             'recent': self.store.recent_done(),
             'lan_enabled': self.settings.lan_enabled,
             'port': port,
-            'urls': [f'http://{h}:{port}/' for h in self.hosts] if address else [],
+            'urls': urls,
+            'url_qrs': self.url_qrs(urls),
             'pin': self.service.sessions.pin,
             'sessions': self.service.sessions.session_count(),
             'server_error': self.server_error,
@@ -1115,7 +1146,7 @@ select,input,button{font:inherit;padding:7px;margin:4px 0;border-radius:6px;max-
 option{color:#000}button{background:var(--orca-accent,#4a89e8);color:var(--orca-accent-fg,#fff);border:0;cursor:pointer}button.secondary{background:transparent;color:inherit;border:1px solid var(--orca-border,#888)}
 .row{border-bottom:1px solid var(--orca-border,#555);padding:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row .grow{flex:1;min-width:200px}
 .sw{display:inline-block;width:14px;height:14px;border-radius:50%;border:1px solid #888;vertical-align:middle;margin-right:6px}.warn{color:#e6a756}.err{color:#ff8e89}.ok{color:#8fe3a0}.muted{opacity:.75}.pin{font-size:26px;font-weight:700;letter-spacing:4px}
-#label svg{width:220px;background:#fff}code{user-select:all}
+#label svg{width:220px;background:#fff}.qrs{display:flex;gap:12px;flex-wrap:wrap}.qrs figure{margin:0;text-align:center}.qrs svg{width:160px;height:160px;background:#fff;padding:4px;border-radius:6px}.qrs figcaption{font-size:12px;opacity:.8}code{user-select:all}
 </style><h1>🧵 Filament QR</h1><div id="banner"></div>
 <div class="grid"><section><h2>Новая катушка</h2>
 <label>Профиль филамента</label><select id="profile"></select>
@@ -1154,6 +1185,8 @@ function render(s){S=s;
  const ph=$('phone');ph.replaceChildren();
  if(s.server_error)ph.append(el('p',s.server_error,'err'));
  for(const u of s.urls||[]){const p=el('p','Адрес: ');p.append(el('code',u));ph.append(p)}
+ if(s.lan_enabled){const box=el('div',undefined,'qrs');for(const q of s.url_qrs||[]){const f=el('figure');f.innerHTML=q.svg;f.append(el('figcaption',q.url));box.append(f)}
+  if(box.childNodes.length){ph.append(el('p','Наведите камеру телефона на код, чтобы открыть страницу:','muted'));ph.append(box)}}
  if(!s.lan_enabled)ph.append(el('p','Сейчас доступ только с этого компьютера. Включите доступ из сети, чтобы сканировать телефоном.','warn'));
  const pin=el('p','PIN: ');pin.append(el('span',s.pin,'pin'));ph.append(pin);ph.append(el('p','Подключённых телефонов: '+s.sessions,'muted'));
  if(document.activeElement!==$('port'))$('port').value=s.port;if(document.activeElement!==$('lan'))$('lan').checked=s.lan_enabled;

@@ -105,5 +105,8 @@ class PageTest(unittest.TestCase):
         self.assertIn('s.decoder_error', fq.PLUGIN_HTML)
         self.assertIn('swatch(', fq.PLUGIN_HTML)
 
+    def test_plugin_page_shows_address_qr_codes(self):
+        self.assertIn('s.url_qrs', fq.PLUGIN_HTML)
+
     def test_phone_page_shows_spool_colour(self):
         self.assertIn('swatch(', fq.PHONE_HTML)
