@@ -54,6 +54,7 @@ class BackgroundSlicingProcess;
 enum SLAPrintObjectStep : unsigned int;
 enum class ConversionType : int;
 class DevAms;
+struct FilamentSelectionResult;
 
 using ModelInstancePtrs = std::vector<ModelInstance*>;
 

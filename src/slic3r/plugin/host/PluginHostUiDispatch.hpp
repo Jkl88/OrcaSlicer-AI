@@ -15,10 +15,13 @@
 
 namespace Slic3r::host_ui_dispatch {
 
-inline constexpr auto wait_timeout = std::chrono::seconds(30);
+inline constexpr std::chrono::milliseconds wait_timeout = std::chrono::seconds(30);
+// For calls that wait on the user, e.g. a modal confirmation dialog.
+inline constexpr std::chrono::milliseconds no_timeout = std::chrono::milliseconds::zero();
 
+// Runs fn on the wx main thread with the GIL released and returns its result or rethrows its exception.
 template<typename Fn>
-auto run_blocking(Fn&& fn) -> std::invoke_result_t<std::decay_t<Fn>&>
+auto run_blocking(Fn&& fn, std::chrono::milliseconds timeout = wait_timeout) -> std::invoke_result_t<std::decay_t<Fn>&>
 {
     using Callable = std::decay_t<Fn>;
     using Result = std::invoke_result_t<Callable&>;
@@ -57,7 +60,9 @@ auto run_blocking(Fn&& fn) -> std::invoke_result_t<std::decay_t<Fn>&>
         }
     });
 
-    if (future.wait_for(wait_timeout) != std::future_status::ready)
+    if (timeout == no_timeout)
+        future.wait();
+    else if (future.wait_for(timeout) != std::future_status::ready)
         throw std::runtime_error("Timed out waiting for the OrcaSlicer UI thread");
     return future.get();
 }

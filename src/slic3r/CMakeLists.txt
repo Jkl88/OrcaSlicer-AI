@@ -132,6 +132,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/PluginPickerDialog.hpp
     GUI/PluginsDialog.cpp
     GUI/PluginsDialog.hpp
+    GUI/PluginPresetTransactionDialog.cpp
+    GUI/PluginPresetTransactionDialog.hpp
     GUI/SpeedDialDialog.cpp
     GUI/SpeedDialDialog.hpp
     GUI/ActionRegistry.cpp
@@ -642,6 +644,7 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHostSlicing.cpp
     plugin/host/PluginHostUi.cpp
     plugin/host/PluginHostUi.hpp
+    plugin/host/PluginHostUiDispatch.hpp
     plugin/host/PluginPages.cpp
     plugin/host/PluginPages.hpp
     plugin/CloudPluginService.cpp

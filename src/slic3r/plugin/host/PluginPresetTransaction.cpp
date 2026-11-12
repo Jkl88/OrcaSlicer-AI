@@ -1,4 +1,5 @@
 #include "PluginPresetTransaction.hpp"
+#include "PluginPresetSnapshot.hpp"
 
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Preset.hpp>
@@ -46,23 +47,23 @@ PresetTransactionResult parse_transaction_request(const json& request_json)
         request_json["expected_revision"].get<std::string>().empty())
         return diagnostic_result(PresetTransactionStatus::Invalid, "missing_expected_revision", std::nullopt,
                                  "expected_revision", "Transaction request requires a non-empty expected_revision");
-    if (!request_json.contains("operations") || !request_json["operations"].is_array())
-        return diagnostic_result(PresetTransactionStatus::Invalid, "invalid_operations", std::nullopt, "operations",
-                                 "Transaction request requires an operations array");
-    if (request_json["operations"].empty())
-        return diagnostic_result(PresetTransactionStatus::Invalid, "empty_operations", std::nullopt, "operations",
-                                 "Transaction request requires at least one operation");
-
     if (request_json.contains("interaction") && !request_json["interaction"].is_string())
         return diagnostic_result(PresetTransactionStatus::Invalid, "invalid_interaction", std::nullopt, "interaction",
                                  "Transaction interaction must be a string");
 
     PresetTransactionRequest request;
     request.expected_revision = request_json["expected_revision"].get<std::string>();
-    request.interaction = request_json.value("interaction", "confirm");
-    if (request.interaction != "confirm")
+    request.interaction = request_json.value("interaction", "require_user_confirmation");
+    if (request.interaction != "require_user_confirmation" && request.interaction != "confirm")
         return diagnostic_result(PresetTransactionStatus::Unsupported, "unsupported_interaction", std::nullopt,
                                  "interaction", "Transaction interaction is not supported");
+
+    if (!request_json.contains("operations") || !request_json["operations"].is_array())
+        return diagnostic_result(PresetTransactionStatus::Invalid, "invalid_operations", std::nullopt, "operations",
+                                 "Transaction request requires an operations array");
+    if (request_json["operations"].empty())
+        return diagnostic_result(PresetTransactionStatus::Invalid, "empty_operations", std::nullopt, "operations",
+                                 "Transaction request requires at least one operation");
 
     std::set<std::pair<std::string, std::string>> assigned_keys;
     const json& operations = request_json["operations"];
@@ -137,19 +138,7 @@ PresetTransactionResult validate_transaction_shape(const json& request_json, con
 
 namespace {
 
-bool is_sensitive_key(const std::string& key)
-{
-    static const std::set<std::string> sensitive_keys = {
-        "printhost_apikey", "printhost_password", "printhost_client_cert_password",
-        "print_host", "printhost_user", "printhost_ssl_ca_file",
-    };
-    return sensitive_keys.count(key) > 0 ||
-           key.find("_key") != std::string::npos ||
-           key.find("_password") != std::string::npos ||
-           key.find("_token") != std::string::npos ||
-           key.find("_secret") != std::string::npos ||
-           key.find("apikey") != std::string::npos;
-}
+bool is_sensitive_key(const std::string& key) { return is_sensitive_preset_key(key); }
 
 Preset::Type preset_type_from_string(const std::string& type_str)
 {
@@ -261,6 +250,7 @@ StagedPresetChanges stage_value_changes(PresetBundle& bundle, const std::vector<
     }
 
     result.status = PresetTransactionStatus::Valid;
+    result.staged_configs = std::move(config_copies);
     return result;
 }
 
@@ -310,7 +300,7 @@ void rollback_staged_value_changes(PresetBundle& bundle, const StagedPresetChang
     }
 }
 
-FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, size_t slot, const std::string& preset_name)
+FilamentSelectionResult validate_filament_selection(const PresetBundle& bundle, size_t slot, const std::string& preset_name)
 {
     FilamentSelectionResult result;
     result.slot = slot;
@@ -335,64 +325,195 @@ FilamentSelectionResult select_filament_preset_for_test(PresetBundle& bundle, si
         return result;
     }
 
+    result.status = PresetTransactionStatus::Valid;
+    return result;
+}
+
+FilamentSelectionResult select_filament_preset(PresetBundle& bundle, size_t slot, const std::string& preset_name)
+{
+    FilamentSelectionResult result = validate_filament_selection(bundle, slot, preset_name);
+    if (result.status != PresetTransactionStatus::Valid)
+        return result;
+
     bundle.filament_presets[slot] = preset_name;
     result.status = PresetTransactionStatus::Applied;
     result.message = "Filament preset applied successfully";
     return result;
 }
 
-PresetTransactionResult commit_preset_transaction_for_test(
-    PresetBundle& bundle,
-    const std::string& current_revision,
-    const std::string& plugin_id,
-    const json& request_json,
-    const TransactionConfirmCallback& confirm_callback,
-    bool inject_apply_failure)
+const char* to_string(PresetTransactionStatus status)
 {
-    PresetTransactionResult result = parse_transaction_request(request_json);
-    if (result.status != PresetTransactionStatus::Valid)
-        return result;
+    switch (status) {
+    case PresetTransactionStatus::Valid:        return "valid";
+    case PresetTransactionStatus::Invalid:      return "invalid";
+    case PresetTransactionStatus::Unsupported:  return "unsupported";
+    case PresetTransactionStatus::Conflict:     return "conflict";
+    case PresetTransactionStatus::Applied:      return "applied";
+    case PresetTransactionStatus::Cancelled:    return "cancelled";
+    case PresetTransactionStatus::NotFound:     return "not_found";
+    case PresetTransactionStatus::Incompatible: return "incompatible";
+    case PresetTransactionStatus::InvalidSlot:  return "invalid_slot";
+    case PresetTransactionStatus::Error:        return "error";
+    }
+    return "error";
+}
 
-    if (result.request->expected_revision != current_revision) {
-        result.status = PresetTransactionStatus::Conflict;
+json transaction_result_json(const PresetTransactionResult& result)
+{
+    json out = {
+        {"status", to_string(result.status)},
+        {"revision", result.revision},
+        {"affected", result.affected},
+        {"diagnostics", result.diagnostics},
+    };
+    if (!result.message.empty())
+        out["message"] = result.message;
+    return out;
+}
+
+namespace {
+
+// A filament select on slot 0 replaces the edited filament preset, so staged filament values would target
+// a preset that is no longer edited once the selection lands.
+bool has_conflicting_filament_operations(const PresetTransactionRequest& request)
+{
+    bool selects_filament = false;
+    bool edits_filament   = false;
+    for (const PresetOperation& operation : request.operations) {
+        if (const auto* select = std::get_if<SelectPresetOperation>(&operation))
+            selects_filament |= select->preset_type == "filament";
+        else if (std::get<SetValuesOperation>(operation).preset_type == "filament")
+            edits_filament = true;
+    }
+    return selects_filament && edits_filament;
+}
+
+PresetTransactionResult make_result(PresetTransactionStatus status, json diagnostics, std::string message = {})
+{
+    PresetTransactionResult result;
+    result.status      = status;
+    result.diagnostics = std::move(diagnostics);
+    result.message     = std::move(message);
+    return result;
+}
+
+} // namespace
+
+PresetTransactionResult commit_preset_transaction(PresetBundle&                 bundle,
+                                                  const std::string&            current_revision,
+                                                  const std::string&            plugin_id,
+                                                  const json&                   request_json,
+                                                  const PresetTransactionHooks& hooks)
+{
+    PresetTransactionResult parsed = parse_transaction_request(request_json);
+    if (parsed.status != PresetTransactionStatus::Valid)
+        return parsed;
+    const PresetTransactionRequest& request = *parsed.request;
+
+    if (request.expected_revision != current_revision) {
+        PresetTransactionResult result = make_result(PresetTransactionStatus::Conflict, json::array(),
+                                                "The preset workspace changed since the snapshot was taken");
         result.revision = current_revision;
-        result.affected = json::array();
         return result;
     }
 
+    if (has_conflicting_filament_operations(request))
+        return make_result(PresetTransactionStatus::Invalid,
+                      json::array({diagnostic_json("conflicting_operations", 0, "operations",
+                                                   "Filament select and filament set_values cannot share a transaction")}));
+
     std::vector<SetValuesOperation> value_ops;
-    for (const auto& op : result.request->operations) {
-        if (std::holds_alternative<SetValuesOperation>(op)) {
-            value_ops.push_back(std::get<SetValuesOperation>(op));
+    PresetTransactionPreview        preview;
+    std::set<size_t>                selected_slots;
+    for (size_t index = 0; index < request.operations.size(); ++index) {
+        const PresetOperation& operation = request.operations[index];
+        if (const auto* values = std::get_if<SetValuesOperation>(&operation)) {
+            value_ops.push_back(*values);
+            continue;
         }
+        const auto& select = std::get<SelectPresetOperation>(operation);
+        const FilamentSelectionResult check = validate_filament_selection(bundle, select.slot, select.name);
+        if (check.status != PresetTransactionStatus::Valid)
+            return make_result(check.status, json::array({diagnostic_json(to_string(check.status), index, "scope",
+                                                                     check.message.c_str())}));
+        if (!selected_slots.insert(select.slot).second)
+            return make_result(PresetTransactionStatus::Invalid,
+                          json::array({diagnostic_json("duplicate_slot_selection", index, "scope",
+                                                       "A filament slot may be selected only once per transaction")}));
+        if (bundle.filament_presets[select.slot] != select.name)
+            preview.selections.push_back({select.slot, bundle.filament_presets[select.slot], select.name});
     }
 
     StagedPresetChanges staged = stage_value_changes(bundle, value_ops);
-    if (staged.status != PresetTransactionStatus::Valid) {
-        result.status = staged.status;
-        result.diagnostics = staged.diagnostics;
-        return result;
-    }
+    if (staged.status != PresetTransactionStatus::Valid)
+        return make_result(staged.status, staged.diagnostics);
+    for (const StagedValueChange& change : staged.changes)
+        if (change.old_value != change.new_value)
+            preview.values.push_back(change);
 
-    if (!confirm_callback(plugin_id, staged.changes)) {
-        result.status = PresetTransactionStatus::Cancelled;
-        result.message = "User cancelled the transaction";
-        return result;
-    }
-
-    try {
-        if (inject_apply_failure) {
-            throw std::runtime_error("Injected apply failure for testing");
-        }
-        apply_staged_value_changes(bundle, staged);
-        result.status = PresetTransactionStatus::Applied;
+    if (preview.values.empty() && preview.selections.empty()) {
+        PresetTransactionResult result = make_result(PresetTransactionStatus::Applied, json::array(), "Nothing to change");
         result.revision = current_revision;
-    } catch (const std::exception& e) {
-        result.status = PresetTransactionStatus::Error;
-        result.message = std::string("Apply failed: ") + e.what();
-        rollback_staged_value_changes(bundle, staged);
+        return result;
     }
 
+    if (!hooks.confirm || !hooks.confirm(plugin_id, preview))
+        return make_result(PresetTransactionStatus::Cancelled, json::array(), "User cancelled the transaction");
+
+    const auto apply_config = [&](const std::string& type, const DynamicPrintConfig& config) {
+        if (hooks.apply_config)
+            hooks.apply_config(type, config);
+        else
+            get_edited_preset(bundle, type).config = config;
+    };
+    const auto select_filament = [&](size_t slot, const std::string& name) {
+        return hooks.select_filament ? hooks.select_filament(slot, name) : select_filament_preset(bundle, slot, name);
+    };
+
+    std::vector<std::string>    applied_types;
+    std::vector<StagedSelection> applied_selections;
+    const auto rollback = [&] {
+        for (auto it = applied_selections.rbegin(); it != applied_selections.rend(); ++it) {
+            try {
+                select_filament(it->slot, it->old_name);
+            } catch (const std::exception&) {
+            }
+        }
+        for (const std::string& type : applied_types) {
+            try {
+                apply_config(type, staged.original_configs.at(type));
+            } catch (const std::exception&) {
+            }
+        }
+    };
+
+    PresetTransactionResult result;
+    try {
+        for (const auto& [type, config] : staged.staged_configs) {
+            applied_types.push_back(type);
+            apply_config(type, config);
+        }
+        for (const StagedSelection& selection : preview.selections) {
+            const FilamentSelectionResult selected = select_filament(selection.slot, selection.new_name);
+            if (selected.status != PresetTransactionStatus::Applied) {
+                rollback();
+                return make_result(selected.status, json::array(), selected.message);
+            }
+            applied_selections.push_back(selection);
+        }
+    } catch (const std::exception& e) {
+        rollback();
+        return make_result(PresetTransactionStatus::Error, json::array(), std::string("Apply failed: ") + e.what());
+    }
+
+    result.status = PresetTransactionStatus::Applied;
+    for (const StagedValueChange& change : preview.values)
+        result.affected.push_back({{"op", "set_values"}, {"preset_type", change.preset_type}, {"key", change.key},
+                                   {"old_value", change.old_value}, {"new_value", change.new_value}});
+    for (const StagedSelection& selection : preview.selections)
+        result.affected.push_back({{"op", "select"}, {"preset_type", "filament"}, {"slot", selection.slot},
+                                   {"old_name", selection.old_name}, {"name", selection.new_name}});
+    result.revision = hooks.revision ? hooks.revision() : current_revision;
     return result;
 }
 

@@ -27,6 +27,18 @@ bool has_attr(const py::handle& object, const char* name)
     return py::hasattr(object, name);
 }
 
+bool is_callable(const py::handle& object)
+{
+    return PyCallable_Check(object.ptr()) != 0;
+}
+
+void add_filament_preset(Slic3r::PresetBundle& bundle, const std::string& name, bool compatible = true)
+{
+    Slic3r::Preset& preset = bundle.filaments.load_preset(std::string(), name, bundle.filaments.default_preset().config,
+                                                         /*select=*/false);
+    preset.is_compatible = compatible;
+}
+
 } // namespace
 
 TEST_CASE("Plugin host storage is private to the active plugin", "[PluginHost][Python]")
@@ -112,7 +124,7 @@ TEST_CASE("Plugin storage rejects a symlinked data root", "[PluginHost][Regressi
 {
     namespace fs = boost::filesystem;
     Slic3r::ScopedDataDir data_dir_guard("plugin-host-storage-root-symlink");
-    Slic3r::ScopedTemporaryDir external("orca-plugin-storage-external-root");
+    ScopedTemporaryDir external("orca-plugin-storage-external-root");
 
     const fs::path storage_root = data_dir_guard.dir / "orca_plugins_data";
     fs::create_directory_symlink(external.path(), storage_root);
@@ -385,10 +397,11 @@ TEST_CASE("Preset value staging rolls back on apply failure", "[PluginHost]")
 TEST_CASE("Filament selection validates slot bounds", "[PluginHost]")
 {
     Slic3r::PresetBundle bundle;
+    add_filament_preset(bundle, "Generic PLA");
+    add_filament_preset(bundle, "Generic PETG");
     bundle.filament_presets = {"Generic PLA", "Generic PETG"};
 
-    const Slic3r::FilamentSelectionResult invalid_slot =
-        Slic3r::select_filament_preset_for_test(bundle, 5, "Generic PLA");
+    const Slic3r::FilamentSelectionResult invalid_slot = Slic3r::select_filament_preset(bundle, 5, "Generic PLA");
     CHECK(invalid_slot.status == Slic3r::PresetTransactionStatus::InvalidSlot);
     CHECK(bundle.filament_presets[0] == "Generic PLA");
     CHECK(bundle.filament_presets[1] == "Generic PETG");
@@ -397,19 +410,16 @@ TEST_CASE("Filament selection validates slot bounds", "[PluginHost]")
 TEST_CASE("Filament selection validates preset existence and compatibility", "[PluginHost]")
 {
     Slic3r::PresetBundle bundle;
+    add_filament_preset(bundle, "Generic PLA");
+    add_filament_preset(bundle, "IncompatibleFilament", false);
     bundle.filament_presets = {"Generic PLA"};
 
-    const Slic3r::FilamentSelectionResult not_found =
-        Slic3r::select_filament_preset_for_test(bundle, 0, "NonexistentPreset");
+    const Slic3r::FilamentSelectionResult not_found = Slic3r::select_filament_preset(bundle, 0, "NonexistentPreset");
     CHECK(not_found.status == Slic3r::PresetTransactionStatus::NotFound);
     CHECK(bundle.filament_presets[0] == "Generic PLA");
 
-    Slic3r::Preset incompatible_preset("IncompatibleFilament", false);
-    incompatible_preset.is_compatible = false;
-    bundle.filaments.presets.push_back(incompatible_preset);
-
     const Slic3r::FilamentSelectionResult incompatible =
-        Slic3r::select_filament_preset_for_test(bundle, 0, "IncompatibleFilament");
+        Slic3r::select_filament_preset(bundle, 0, "IncompatibleFilament");
     CHECK(incompatible.status == Slic3r::PresetTransactionStatus::Incompatible);
     CHECK(bundle.filament_presets[0] == "Generic PLA");
 }
@@ -417,14 +427,12 @@ TEST_CASE("Filament selection validates preset existence and compatibility", "[P
 TEST_CASE("Filament selection applies valid changes", "[PluginHost]")
 {
     Slic3r::PresetBundle bundle;
+    add_filament_preset(bundle, "Generic PLA");
+    add_filament_preset(bundle, "Generic PETG");
+    add_filament_preset(bundle, "Generic ABS");
     bundle.filament_presets = {"Generic PLA", "Generic PETG"};
 
-    Slic3r::Preset new_preset("Generic ABS", false);
-    new_preset.is_compatible = true;
-    bundle.filaments.presets.push_back(new_preset);
-
-    const Slic3r::FilamentSelectionResult applied =
-        Slic3r::select_filament_preset_for_test(bundle, 1, "Generic ABS");
+    const Slic3r::FilamentSelectionResult applied = Slic3r::select_filament_preset(bundle, 1, "Generic ABS");
     CHECK(applied.status == Slic3r::PresetTransactionStatus::Applied);
     CHECK(applied.slot == 1);
     CHECK(applied.preset_name == "Generic ABS");
@@ -459,17 +467,17 @@ TEST_CASE("Plugin host API v1 surfaces are callable", "[PluginHost][Python]")
     py::object host = import_orca_module().attr("host");
 
     CHECK(has_attr(host, "api_info"));
-    CHECK(py::callable(host.attr("api_info")));
+    CHECK(is_callable(host.attr("api_info")));
 
     py::object v1 = host.attr("v1");
     CHECK(has_attr(v1, "plugin_storage"));
-    CHECK(py::callable(v1.attr("plugin_storage")));
+    CHECK(is_callable(v1.attr("plugin_storage")));
 
     py::object presets = v1.attr("presets");
     CHECK(has_attr(presets, "snapshot"));
-    CHECK(py::callable(presets.attr("snapshot")));
+    CHECK(is_callable(presets.attr("snapshot")));
     CHECK(has_attr(presets, "commit"));
-    CHECK(py::callable(presets.attr("commit")));
+    CHECK(is_callable(presets.attr("commit")));
 }
 
 TEST_CASE("Plugin host API returns structured errors without native exceptions", "[PluginHost][Python]")

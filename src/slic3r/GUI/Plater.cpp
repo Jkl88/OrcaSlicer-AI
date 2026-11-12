@@ -5585,6 +5585,8 @@ struct Plater::priv
     void on_combobox_select(wxCommandEvent&);
     void on_select_bed_type(wxCommandEvent&);
     void on_select_preset(wxCommandEvent&);
+    // Assigns a filament preset to a slot with the bookkeeping every selection path needs.
+    void set_filament_slot_preset(int idx, const std::string& preset_name, bool was_support_filament);
     void on_slicing_update(SlicingStatusEvent&);
     void on_slicing_completed(wxCommandEvent&);
     void on_process_completed(SlicingProcessCompletedEvent&);
@@ -10422,6 +10424,16 @@ void Plater::priv::on_select_bed_type(wxCommandEvent &evt)
     }
 }
 
+void Plater::priv::set_filament_slot_preset(int idx, const std::string& preset_name, bool was_support_filament)
+{
+    wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
+    wxGetApp().plater()->update_project_dirty_from_presets();
+    wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+    sidebar->update_dynamic_filament_list();
+    if (was_support_filament != is_support_filament(idx) && wxGetApp().app_config->get("auto_calculate_flush") == "all")
+        sidebar->auto_calc_flushing_volumes(idx);
+}
+
 void Plater::priv::on_select_preset(wxCommandEvent &evt)
 {
     PlaterPresetComboBox* combo = static_cast<PlaterPresetComboBox*>(evt.GetEventObject());
@@ -10479,14 +10491,7 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     }
 
     if (preset_type == Preset::TYPE_FILAMENT) {
-        wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
-        wxGetApp().plater()->update_project_dirty_from_presets();
-        wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
-        sidebar->update_dynamic_filament_list();
-        bool flag_is_change = is_support_filament(idx);
-        if (flag != flag_is_change && wxGetApp().app_config->get("auto_calculate_flush") == "all") {
-            sidebar->auto_calc_flushing_volumes(idx);
-        }
+        set_filament_slot_preset(idx, preset_name, flag);
         auto select_flag = combo->GetFlag(selection);
         combo->ShowBadge(select_flag == (int)PresetComboBox::FilamentAMSType::FROM_AMS);
         q->on_filament_change(idx);
@@ -17610,44 +17615,35 @@ void Plater::on_filament_change(size_t filament_idx)
 
 FilamentSelectionResult Plater::select_filament_preset_for_plugin(size_t slot, const std::string& preset_name)
 {
-    FilamentSelectionResult result;
-    result.slot = slot;
-    result.preset_name = preset_name;
-
-    PresetBundle* bundle = wxGetApp().preset_bundle;
-    if (!bundle) {
-        result.status = PresetTransactionStatus::Error;
-        result.message = "Preset bundle not available";
+    PresetBundle& bundle = *wxGetApp().preset_bundle;
+    FilamentSelectionResult result = validate_filament_selection(bundle, slot, preset_name);
+    if (result.status != PresetTransactionStatus::Valid)
         return result;
-    }
 
-    if (slot >= bundle->filament_presets.size()) {
-        result.status = PresetTransactionStatus::InvalidSlot;
-        result.message = "Filament slot index out of range";
-        return result;
-    }
-
-    const Preset* preset = bundle->filaments.find_preset(preset_name, false);
-    if (!preset) {
-        result.status = PresetTransactionStatus::NotFound;
-        result.message = "Filament preset not found: " + preset_name;
-        return result;
-    }
-
-    if (!preset->is_compatible) {
-        result.status = PresetTransactionStatus::Incompatible;
-        result.message = "Filament preset is not compatible with current printer";
-        return result;
-    }
-
-    bundle->set_filament_preset(slot, preset_name);
-    update_project_dirty_from_presets();
-    bundle->export_selections(*wxGetApp().app_config);
-    p->sidebar->update_dynamic_filament_list();
+    const std::string previous = bundle.filament_presets[slot];
+    const int         idx      = int(slot);
+    p->set_filament_slot_preset(idx, preset_name, is_support_filament(idx));
     on_filament_change(slot);
 
-    result.status = PresetTransactionStatus::Applied;
-    result.message = "Filament preset applied successfully";
+    // Same rule as the combo box: with a single filament the Filament tab follows the slot, which may ask
+    // the user what to do with unsaved edits.
+    if (!p->sidebar->is_multifilament()) {
+        wxWindowUpdateLocker no_updates(p->sidebar->filament_panel());
+        wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(preset_name);
+        if (bundle.filaments.get_edited_preset().name != preset_name) {
+            p->set_filament_slot_preset(idx, previous, is_support_filament(idx));
+            on_filament_change(slot);
+            p->sidebar->update_presets(Preset::TYPE_FILAMENT);
+            result.status  = PresetTransactionStatus::Cancelled;
+            result.message = "Filament selection was cancelled";
+            return result;
+        }
+    }
+
+    p->sidebar->update_presets(Preset::TYPE_FILAMENT);
+    on_config_change(bundle.full_config());
+    result.status  = PresetTransactionStatus::Applied;
+    result.message = "Filament preset applied";
     return result;
 }
 
