@@ -7,6 +7,7 @@ Run from the repo root:  python -m unittest discover -s scripts/tests -v
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -115,6 +116,14 @@ class PluginReleaseTest(unittest.TestCase):
         release.update_hashes(self.root)
         self.assertEqual(self.manifest()["plugins"][0]["platforms"]["macos-arm64"], "not-tested")
         self.assertEqual(release.check(self.root), [])
+
+    @unittest.skipUnless(shutil.which("git") and (REPO / ".git").exists(), "needs a git checkout")
+    def test_shipped_files_keep_lf_on_every_platform(self):
+        manifest = json.loads((REPO / release.MANIFEST).read_text(encoding="utf-8"))
+        files = [p["file"] for p in manifest["plugins"]] + [release.MANIFEST]
+        out = subprocess.run(["git", "check-attr", "eol", "--"] + files, cwd=REPO, capture_output=True,
+                             text=True, check=True).stdout
+        self.assertEqual([line.rsplit(": ", 1)[1] for line in out.splitlines()], ["lf"] * len(files))
 
     def test_main_exit_codes(self):
         self.assertEqual(release.main(["check", "--root", str(self.root)]), 0)

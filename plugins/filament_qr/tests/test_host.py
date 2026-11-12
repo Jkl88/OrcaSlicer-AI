@@ -91,8 +91,8 @@ class SelectTest(TempDirTest):
         super().setUp()
         self.host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'])
 
-    def select(self, slot=1, profile='Generic PETG'):
-        return in_worker(fq.select_in_slot, self.host, slot, profile)
+    def select(self, slot=1, profile='Generic PETG', current='Generic PLA'):
+        return in_worker(fq.select_in_slot, self.host, slot, profile, current)
 
     def test_confirmed_selection_uses_one_based_slot(self):
         status, _ = self.select()
@@ -102,8 +102,7 @@ class SelectTest(TempDirTest):
         self.assertEqual(self.host.slots, ['Generic PLA', 'Generic PETG'])
         text, buttons = self.host.dialogs[0]
         self.assertEqual(buttons, 'yes_no')
-        self.assertIn('Generic PETG', text)
-        self.assertIn('слот 2', text)
+        self.assertIn('Слот 2: «Generic PLA» → «Generic PETG»', text)
 
     def test_select_declined_marks_cancelled(self):
         self.host.answer = 'no'

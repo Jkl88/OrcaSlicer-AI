@@ -17,7 +17,7 @@
       "file": "plugins/ai_assist/orca_ai_assist.py",
       "version": "1.1.0",
       "min_host": "2.5.0",
-      "sha256": "2f9e3dc94b2b5afbdf75d93c410863364aa1409b0cd672716308cea89f679b7b",
+      "sha256": "ed9fc7674f14552c6a15260b3a82405dd1af43a6ee4ad2317bf8dd27ed7590f1",
       "platforms": {
         "windows-x64": "not-tested",
         "linux-x64": "not-tested",
@@ -29,7 +29,7 @@
       "file": "plugins/filament_qr/orca_filament_qr.py",
       "version": "1.1.0",
       "min_host": "2.5.0",
-      "sha256": "7196ea33525af28563de2ee1d11e9ef7cd71354ff2b899e88e2d53c12721728c",
+      "sha256": "851c886dc0a6df7eb5e74005cb0dfa02bbeb342f1e88a3c102d1a9bdd141ae11",
       "platforms": {
         "windows-x64": "not-tested",
         "linux-x64": "not-tested",

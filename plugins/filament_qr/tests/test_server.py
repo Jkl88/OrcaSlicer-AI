@@ -1,10 +1,47 @@
 import http.client
 import json
+import errno
 import socket
+import sys
 import threading
 import time
+from unittest import mock
 
 from tests.helpers import TempDirTest, fq
+
+_NAME_LOOKUPS = []
+_RECORDING = threading.Event()
+
+
+def _record_name_lookups(event, args):
+    if _RECORDING.is_set() and event in ('socket.gethostname', 'socket.gethostbyaddr', 'socket.gethostbyname'):
+        _NAME_LOOKUPS.append(event)
+
+
+sys.addaudithook(_record_name_lookups)
+
+
+class BindTest(TempDirTest):
+    """OrcaSlicer judges every socket audit event, so binding must not resolve host names."""
+
+    def test_lan_bind_does_no_name_lookup(self):
+        server = fq.FilamentHttpServer(fq.Service(fq.Store(self.tmp / 'db.sqlite3')))
+        _NAME_LOOKUPS.clear()
+        _RECORDING.set()
+        try:
+            server.start('0.0.0.0', 0)
+        finally:
+            _RECORDING.clear()
+            server.stop()
+        self.assertEqual(_NAME_LOOKUPS, [])
+
+    def test_os_permission_error_is_not_blamed_on_plugin_permissions(self):
+        server = fq.FilamentHttpServer(fq.Service(fq.Store(self.tmp / 'db.sqlite3')))
+        denied = PermissionError(errno.EACCES, 'Permission denied')
+        with mock.patch.object(fq, '_BoundedServer', side_effect=denied), self.assertRaises(RuntimeError) as ctx:
+            server.start('127.0.0.1', 18999)
+        self.assertIn('Не удалось открыть порт 18999', str(ctx.exception))
+        self.assertNotIn('«Плагины»', str(ctx.exception))
 
 
 class ServerTest(TempDirTest):

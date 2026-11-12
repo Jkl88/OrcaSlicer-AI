@@ -367,6 +367,11 @@ HTTP_HINTS = {
 }
 
 
+def _audit_denial(exc: Any) -> bool:
+    """OrcaSlicer's plugin permission hook raises PermissionError without an errno; the OS sets one."""
+    return isinstance(exc, PermissionError) and exc.errno is None
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Redirects would resend the x-goog-api-key header to another URL; refuse them."""
 
@@ -409,12 +414,12 @@ class GeminiClient:
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise GeminiError(self._timeout_message()) from None
-            if isinstance(exc.reason, PermissionError):
+            if _audit_denial(exc.reason):
                 raise GeminiError(self._permission_message()) from None
             raise GeminiError(self._redact(f"Не удалось подключиться к Gemini: {exc.reason}")) from None
-        except PermissionError:
-            raise GeminiError(self._permission_message()) from None
         except (OSError, http.client.HTTPException) as exc:
+            if _audit_denial(exc):
+                raise GeminiError(self._permission_message()) from None
             raise GeminiError(self._redact(f"Ошибка сети при обращении к Gemini: {exc}")) from None
         if cancel.is_set():
             raise TaskCancelled()

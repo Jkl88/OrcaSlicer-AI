@@ -11,5 +11,10 @@
 # label lookup fails, so keep these CRLF whatever the platform.
 *.bat text eol=crlf
 
+# Released plugin files are pinned by SHA-256 in plugins/compatibility.json, so a CRLF
+# checkout on Windows would change the bytes that are hashed and shipped.
+plugins/**/*.py text eol=lf
+plugins/compatibility.json text eol=lf
+
 # OCCT BRep fixtures, kept byte for byte as OCCT wrote them.
 *.brep -text

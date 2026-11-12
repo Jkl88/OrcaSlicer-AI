@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -428,6 +429,15 @@ class AutomaticModeTests(AppTestCase):
         self.assertIn("«Плагины»", status["text"])
         self.assertIn("127.0.0.1", status["text"])
         self.assertNotIn("Traceback", status["text"])
+
+    def test_os_permission_error_is_not_blamed_on_plugin_permissions(self):
+        self.configure()
+        refused = urllib.error.URLError(PermissionError(errno.EACCES, "Permission denied"))
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=refused):
+            self.app.handle({"type": "analyze"})
+            status = self.page.wait_for(lambda m: m.get("type") == "status" and m["level"] == "error")
+        self.assertIn("Не удалось подключиться", status["text"])
+        self.assertNotIn("«Плагины»", status["text"])
 
     def test_invalid_model_answer_shows_error_without_rows(self):
         self.configure()

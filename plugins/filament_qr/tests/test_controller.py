@@ -50,6 +50,7 @@ class ControllerTest(TempDirTest):
         settle(controller)
         self.assertEqual(host.violations, [])
         self.assertEqual(host.begins, [(2, 'PLA Basic')])
+        self.assertIn('Слот 2: «Generic PLA» → «PLA Basic»', host.dialogs[0][0])
         self.assertEqual(controller.store.recent_done()[0]['profile'], 'PLA Basic')
 
     def test_single_selection_in_flight(self):

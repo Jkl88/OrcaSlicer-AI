@@ -29,6 +29,7 @@ import os
 import re
 import secrets
 import socket
+import socketserver
 import sqlite3
 import tempfile
 import threading
@@ -478,10 +479,11 @@ def prepare_pending(host, store, pending, caps):
     return 'select'
 
 
-def select_in_slot(host, slot, profile):
-    """Confirm and select profile into zero-based slot. Must not run on the GUI thread.
-    Returns (status, message) for the store."""
-    question = f'Выбрать профиль «{profile}» в слот {slot + 1}?\n\nЗапрос пришёл со сканера Filament QR.'
+def select_in_slot(host, slot, profile, current):
+    """Confirm and select profile into zero-based slot that now holds current. Must not run on the GUI
+    thread. Returns (status, message) for the store."""
+    question = (f'Выбрать профиль филамента?\n\nСлот {slot + 1}: «{current}» → «{profile}»\n\n'
+                'Запрос пришёл со сканера Filament QR.')
     if host.ui.message(question, title='Filament QR', buttons='yes_no', icon='question') != 'yes':
         return 'cancelled', CANCELLED_TEXT
     try:
@@ -548,6 +550,12 @@ class _BoundedServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
     allow_reuse_address = False
+
+    def server_bind(self):
+        # HTTPServer.server_bind() resolves the host name (getfqdn), which OrcaSlicer audits as a
+        # permission request for a target the plugin cannot declare; the name is never used.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def __init__(self, address, handler, service):
         self.service = service
@@ -748,11 +756,10 @@ class FilamentHttpServer:
         self.stop()
         try:
             self._server = _BoundedServer((bind, int(port)), _Handler, self.service)
-        except PermissionError as exc:
-            self._server = None
-            raise RuntimeError(PERMISSION_TEXT) from exc
         except OSError as exc:
             self._server = None
+            if isinstance(exc, PermissionError) and exc.errno is None:  # OrcaSlicer's audit denial
+                raise RuntimeError(PERMISSION_TEXT) from exc
             raise RuntimeError(f'Не удалось открыть порт {port}: {exc.strerror or exc}') from exc
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={'poll_interval': 0.2},
                                         name='filament-qr-http', daemon=True)
@@ -896,10 +903,12 @@ class Controller:
 
     def _start_selection(self, pending):
         pid, slot, profile = pending['id'], int(pending['slot']), pending['profile']
+        slots = self.refresh_workspace().slots
+        current = slots[slot] if slot < len(slots) else ''
 
         def run():
             try:
-                status, message = select_in_slot(self.host, slot, profile)
+                status, message = select_in_slot(self.host, slot, profile, current)
             except Exception as exc:
                 status, message = 'needs_attention', f'Ошибка OrcaSlicer при выборе профиля: {exc}'
             with self._lock:
