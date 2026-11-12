@@ -1,0 +1,110 @@
+name: Plugins
+
+on:
+  push:
+    branches:
+    - plugins-v2.5.0
+    tags:
+    - 'plugins-v*'
+  pull_request:
+    paths:
+    - 'plugins/**'
+    - 'scripts/plugin_release.py'
+    - 'scripts/tests/test_plugin_release.py'
+    - '.github/workflows/plugins.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # The same pins as the Filament QR PEP 723 header; OrcaSlicer installs them for the user.
+      - name: Install Filament QR dependencies
+        run: python -m pip install "qrcode>=7.4,<9" "Pillow>=10,<13" "zxing-cpp>=2.3,<4"
+
+      - name: AI Assist tests
+        run: python -m unittest discover -s plugins/ai_assist/tests -t plugins/ai_assist -v
+
+      - name: Filament QR tests
+        run: python -m unittest discover -s plugins/filament_qr/tests -t plugins/filament_qr -v
+
+      - name: Release tooling tests
+        run: python -m unittest scripts.tests.test_plugin_release -v
+
+      - name: Check compatibility manifest
+        run: python scripts/plugin_release.py check
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build plugin packages
+        run: python3 scripts/plugin_release.py build --out dist
+
+      - name: Short commit
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: orca-plugins-${{ steps.sha.outputs.short }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/plugins-v')
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Short commit
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: orca-plugins-${{ steps.sha.outputs.short }}
+          path: dist
+
+      # A rerun of the same tag uploads nothing if the published checksums match; a release that
+      # already carries other plugin files is never overwritten.
+      - name: Publish GitHub release
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir published 2>/dev/null; then
+              if cmp -s published/SHA256SUMS dist/SHA256SUMS; then
+                echo "Release $TAG already has these exact files."
+                exit 0
+              fi
+              echo "::error::Release $TAG already has different plugin files; bump the plugin versions and use a new tag."
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Plugins $TAG for OrcaSlicer 2.5.0" \
+              --notes "AI Assist and Filament QR for the official OrcaSlicer 2.5.0. See docs/release/plugins.md for installation, permissions and compatibility.json."
+          fi

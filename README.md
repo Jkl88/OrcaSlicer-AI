@@ -1,3 +1,9 @@
+> **OrcaSlicer-AI fork, branch `plugins-v2.5.0`.** This branch is the unmodified official OrcaSlicer v2.5.0 plus two
+> standalone plugins, [AI Assist](plugins/ai_assist/README.md) and [Filament QR](plugins/filament_qr/README.md),
+> for the official OrcaSlicer 2.5.0 or newer. Install them from the `plugins-v*` releases through
+> **File → Plugins → Install local plugin**. See [docs/PLUGINS_RU.md](docs/PLUGINS_RU.md) and
+> [docs/release/plugins.md](docs/release/plugins.md).
+
 <div align="center">
 
 <picture>
