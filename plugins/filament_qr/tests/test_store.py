@@ -22,9 +22,32 @@ class StoreSchemaTest(TempDirTest):
         db.close()
 
         store = fq.Store(path)
-        self.assertEqual(store.schema_version(), 1)
+        self.assertEqual(store.schema_version(), fq.SCHEMA_VERSION)
         self.assertEqual(store.get_spool('FQ-ABCDEF')['profile'], 'Generic PLA')
+        self.assertEqual(store.get_spool('FQ-ABCDEF')['color'], '')
         self.assertEqual(store.enqueue_scan('abcdef', 0)['code'], 'FQ-ABCDEF')
+
+    def test_version_1_database_gets_colour_columns(self):
+        path = self.tmp / 'filament_qr.sqlite3'
+        db = sqlite3.connect(str(path))
+        db.execute('''CREATE TABLE spools (code TEXT PRIMARY KEY, profile TEXT NOT NULL, printer TEXT NOT NULL,
+                      material TEXT NOT NULL, brand TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+                      created TEXT NOT NULL)''')
+        db.execute('''CREATE TABLE pending_scans (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL,
+                      profile TEXT NOT NULL, slot INTEGER NOT NULL, status TEXT NOT NULL,
+                      attempts INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '',
+                      host_revision TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, updated TEXT NOT NULL)''')
+        db.execute("INSERT INTO spools VALUES ('FQ-ABCDEF','Generic PLA','Printer A','PLA','','','2026-01-01')")
+        db.execute("INSERT INTO pending_scans (code, profile, slot, status, created, updated) "
+                   "VALUES ('FQ-ABCDEF','Generic PLA',0,'queued','t','t')")
+        db.execute('PRAGMA user_version = 1')
+        db.commit()
+        db.close()
+
+        store = fq.Store(path)
+        self.assertEqual(store.schema_version(), 2)
+        self.assertEqual(store.get_spool('FQ-ABCDEF')['color'], '')
+        self.assertEqual(store.list_pending()[0]['color'], '')
 
     def test_newer_schema_is_refused(self):
         path = self.tmp / 'db.sqlite3'
@@ -51,6 +74,17 @@ class StoreSpoolTest(TempDirTest):
         self.store.add_spool('Generic PLA', 'P', 'PLA', token=lambda: 'CCCCCC')
         with self.assertRaises(RuntimeError):
             self.store.add_spool('Generic PLA', 'P', 'PLA', token=lambda: 'CCCCCC')
+
+    def test_colour_is_normalized_and_validated(self):
+        self.assertEqual(self.store.add_spool('Generic PLA', 'P', 'PLA', color='#a1b2c3')['color'], '#A1B2C3')
+        self.assertEqual(self.store.add_spool('Generic PLA', 'P', 'PLA')['color'], '')
+        for bad in ('red', '#12345', '#GGGGGG', '#1234567', '"><script>'):
+            with self.subTest(colour=bad), self.assertRaises(ValueError):
+                self.store.add_spool('Generic PLA', 'P', 'PLA', color=bad)
+
+    def test_scan_captures_spool_colour(self):
+        spool = self.store.add_spool('Generic PLA', 'P', 'PLA', color='#FF0000')
+        self.assertEqual(self.store.enqueue_scan(spool['code'], 0)['color'], '#FF0000')
 
     def test_validation(self):
         with self.assertRaises(ValueError):

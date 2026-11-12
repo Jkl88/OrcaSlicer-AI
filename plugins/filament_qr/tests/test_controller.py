@@ -35,6 +35,21 @@ class ControllerTest(TempDirTest):
         self.assertEqual(state['recent'][0]['profile'], 'Generic PETG')
         self.assertEqual(len(state['pin']), 6)
 
+    def test_spool_colour_reaches_the_slot(self):
+        host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'], colour_api=True)
+        controller, _ = self.make(host)
+        [created, _label, _state] = controller.handle(
+            {'type': 'create', 'profile': 'Generic PETG', 'material': 'PETG', 'color': '#00aa00'})
+        self.assertEqual(created['spool']['color'], '#00AA00')
+        controller.handle({'type': 'use', 'code': created['spool']['code'], 'slot': 1})
+        settle(controller)
+        self.assertEqual(host.state['colours'][1], '#00AA00')
+        self.assertEqual(host.slots[1], 'Generic PETG')
+
+    def test_state_reports_decoder_problem(self):
+        controller, _ = self.make()
+        self.assertIn('decoder_error', controller.handle({'type': 'tick'})[-1]['state'])
+
     def test_incompatible_profile_cannot_be_bound(self):
         controller, _ = self.make()
         with self.assertRaises(ValueError):

@@ -36,6 +36,11 @@ class DiscoveryTest(TempDirTest):
         self.assertEqual(caps.mode, 'manual')
         self.assertFalse(caps.storage)
 
+    def test_colour_api_is_detected(self):
+        self.assertFalse(self.discover(automatic_host(self.tmp)).colour)
+        self.assertTrue(self.discover(automatic_host(self.tmp, colour_api=True)).colour)
+        self.assertFalse(self.discover(legacy_host()).colour)
+
     def test_no_host(self):
         caps = fq.HostCapabilities.discover(types.SimpleNamespace())
         self.assertEqual((caps.mode, caps.storage), ('manual', False))
@@ -47,6 +52,13 @@ class WorkspaceTest(TempDirTest):
         self.assertEqual(ws.printer, 'Printer A')
         self.assertEqual(ws.slots, ['Generic PLA', 'Generic PETG'])
         self.assertEqual(ws.profiles, ['Generic PLA', 'Generic PETG'])
+        self.assertEqual(ws.colours, ['#FFFFFF', '#FFFFFF'])
+
+    def test_colours_parse_quoted_values_and_tolerate_missing_api(self):
+        host = automatic_host(self.tmp, slots=['A', 'B'])
+        host.state['colours'] = ['"#ff0000"', '#00FF00']
+        self.assertEqual(fq.read_workspace(host, None).colours, ['#FF0000', '#00FF00'])
+        self.assertEqual(fq.read_workspace(legacy_host(), None).colours, [])
 
 
 class PrepareTest(TempDirTest):
@@ -56,8 +68,8 @@ class PrepareTest(TempDirTest):
         self.host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'])
         self.caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=self.host))
 
-    def prepare(self, profile, slot, host=None, caps=None):
-        spool = self.store.add_spool(profile, 'Printer A', 'X')
+    def prepare(self, profile, slot, host=None, caps=None, color=''):
+        spool = self.store.add_spool(profile, 'Printer A', 'X', color=color)
         pending = self.store.enqueue_scan(spool['code'], slot)
         status = fq.prepare_pending(host or self.host, self.store, self.store.get_pending(pending['id']),
                                     caps or self.caps)
@@ -72,6 +84,13 @@ class PrepareTest(TempDirTest):
     def test_already_active_profile_is_done(self):
         status, row = self.prepare('Generic PLA', 0)
         self.assertEqual((status, row['status']), ('done', 'done'))
+
+    def test_same_profile_with_other_colour_needs_selection_when_host_sets_colours(self):
+        host = automatic_host(self.tmp, slots=['Generic PLA'], colour_api=True)
+        caps = fq.HostCapabilities.discover(types.SimpleNamespace(host=host))
+        self.assertEqual(self.prepare('Generic PLA', 0, host, caps, '#FF0000')[0], 'select')
+        self.assertEqual(self.prepare('Generic PLA', 0, host, caps, '#ffffff')[0], 'done')
+        self.assertEqual(self.prepare('Generic PLA', 0, color='#FF0000')[0], 'done')
 
     def test_missing_slot_and_incompatible_profile_need_attention(self):
         self.assertEqual(self.prepare('Generic PETG', 5)[0], 'needs_attention')
@@ -129,6 +148,28 @@ class SelectTest(TempDirTest):
     def test_other_target_needs_attention(self):
         self.host.target_override = 'Something else'
         self.assertEqual(self.select()[0], 'needs_attention')
+
+    def test_colour_is_set_after_selection_when_supported(self):
+        host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'], colour_api=True)
+        status, message = in_worker(fq.select_in_slot, host, 1, 'Generic PETG', 'Generic PLA', '#FF0000')
+        self.assertEqual(status, 'done')
+        self.assertEqual(host.violations, [])
+        self.assertEqual(host.state['colours'], ['#FFFFFF', '#FF0000'])
+        self.assertIn('цвет', message)
+        self.assertIn('#FF0000', host.dialogs[0][0])
+
+    def test_colour_without_host_support_is_left_to_the_user(self):
+        status, message = in_worker(fq.select_in_slot, self.host, 1, 'Generic PETG', 'Generic PLA', '#FF0000')
+        self.assertEqual(status, 'done')
+        self.assertIn('#FF0000', message)
+        self.assertIn('вручную', message)
+
+    def test_colour_failure_needs_attention(self):
+        host = automatic_host(self.tmp, slots=['Generic PLA', 'Generic PLA'], colour_api=True)
+        host.colour_error = RuntimeError('no slot')
+        status, message = in_worker(fq.select_in_slot, host, 1, 'Generic PETG', 'Generic PLA', '#FF0000')
+        self.assertEqual(status, 'needs_attention')
+        self.assertIn('цвет', message)
 
     def test_permission_error_is_explained(self):
         self.host.begin_error = PermissionError('denied')

@@ -1,5 +1,7 @@
 import io
+import sys
 import unittest
+from unittest import mock
 
 from tests.helpers import fq
 
@@ -23,6 +25,21 @@ class NormalizeTest(unittest.TestCase):
                 fq.normalize_code(text)
 
 
+class DecoderAvailabilityTest(unittest.TestCase):
+    def test_import_failure_reason_is_reported(self):
+        with mock.patch.dict(sys.modules, {'zxingcpp': None}):
+            reason = fq.decoder_error()
+            self.assertIn('zxingcpp', reason)
+            self.assertTrue(reason.startswith('ModuleNotFoundError: '), reason)
+            with self.assertRaises(fq.DecodeError) as ctx:
+                fq.decode_qr_image(b'not an image')
+        self.assertIn('zxingcpp', str(ctx.exception))
+
+    @unittest.skipUnless(HAVE_QR, 'Pillow and zxing-cpp are required')
+    def test_available_decoder_has_no_error(self):
+        self.assertEqual(fq.decoder_error(), '')
+
+
 @unittest.skipUnless(HAVE_QR, 'qrcode, Pillow and zxing-cpp are required')
 class LabelAndDecodeTest(unittest.TestCase):
     spool = {'code': 'FQ-1A2B3C', 'material': 'PETG', 'brand': '<b>eSUN</b> & co', 'profile': 'Generic "PETG"'}
@@ -40,6 +57,12 @@ class LabelAndDecodeTest(unittest.TestCase):
         self.assertNotIn('<b>', svg)
         self.assertNotIn('<script', svg)
         self.assertNotIn('href', svg)
+
+    def test_label_shows_colour_swatch(self):
+        svg = fq.qr_svg(dict(self.spool, color='#FF0000'))
+        self.assertIn('fill="#FF0000"', svg)
+        self.assertIn('#FF0000', svg)
+        self.assertNotIn('class="swatch"', fq.qr_svg(self.spool))
 
     def test_generated_code_round_trips(self):
         self.assertEqual(fq.decode_qr_image(self.png('FQ:FQ-1A2B3C')), ['FQ-1A2B3C'])
@@ -73,3 +96,14 @@ class LabelAndDecodeTest(unittest.TestCase):
         buf = io.BytesIO()
         canvas.save(buf, format='JPEG', quality=90)
         self.assertEqual(fq.decode_qr_image(buf.getvalue()), ['FQ-ABCDEF'])
+
+
+class PageTest(unittest.TestCase):
+    def test_plugin_page_has_colour_picker_and_decoder_warning(self):
+        self.assertIn('id="color" type="color"', fq.PLUGIN_HTML)
+        self.assertIn("color:$('color').value", fq.PLUGIN_HTML)
+        self.assertIn('s.decoder_error', fq.PLUGIN_HTML)
+        self.assertIn('swatch(', fq.PLUGIN_HTML)
+
+    def test_phone_page_shows_spool_colour(self):
+        self.assertIn('swatch(', fq.PHONE_HTML)

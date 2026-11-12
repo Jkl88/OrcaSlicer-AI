@@ -49,18 +49,22 @@ class _Filaments:
 
 
 def _bundle(state, profiles):
+    def full_config_value(key):
+        return ';'.join(state['colours']) if key == 'filament_colour' else None
+
     return types.SimpleNamespace(
         filaments=_Filaments(profiles),
         printers=types.SimpleNamespace(selected_preset_name=lambda: 'Printer A'),
-        current_filament_preset_names=lambda: list(state['slots']))
+        current_filament_preset_names=lambda: list(state['slots']),
+        full_config_value=full_config_value)
 
 
 class UpstreamHost:
     """OrcaSlicer 2.5.0 surface. begin_update/commit raise when called on the thread that built the host."""
 
-    def __init__(self, storage_dir, slots, profiles):
+    def __init__(self, storage_dir, slots, profiles, colour_api=False):
         self.ui_thread = threading.current_thread()
-        self.state = {'slots': list(slots)}
+        self.state = {'slots': list(slots), 'colours': ['#FFFFFF'] * len(slots)}
         self.profiles = dict(profiles)
         self.answer = 'yes'
         self.dialogs, self.begins, self.commits, self.violations = [], [], [], []
@@ -68,6 +72,15 @@ class UpstreamHost:
         self.plugin = types.SimpleNamespace(storage=lambda: str(storage_dir))
         self.ui = types.SimpleNamespace(message=self.message)
         self.preset = types.SimpleNamespace(filament=types.SimpleNamespace(begin_update=self.begin_update))
+        self.colour_error = None
+        if colour_api:
+            self.preset.filament.set_slot_colour = self.set_slot_colour
+
+    def set_slot_colour(self, slot_number, colour):
+        self.off_ui('set_slot_colour')
+        if self.colour_error:
+            raise self.colour_error
+        self.state['colours'][slot_number - 1] = colour
 
     @property
     def slots(self):
@@ -108,12 +121,12 @@ class UpstreamHost:
 DEFAULT_PROFILES = {'Generic PLA': True, 'Generic PETG': True, 'Other ABS': False}
 
 
-def automatic_host(storage_dir, slots=('Generic PLA',), profiles=None):
-    return UpstreamHost(storage_dir, slots, profiles or DEFAULT_PROFILES)
+def automatic_host(storage_dir, slots=('Generic PLA',), profiles=None, colour_api=False):
+    return UpstreamHost(storage_dir, slots, profiles or DEFAULT_PROFILES, colour_api)
 
 
 def legacy_host(slots=('Generic PLA',), profiles=('Generic PLA', 'Generic PETG')):
-    state = {'slots': list(slots)}
+    state = {'slots': list(slots), 'colours': []}
     bundle = _bundle(state, {name: True for name in profiles})
     return types.SimpleNamespace(preset_bundle=lambda: bundle, state=state)
 

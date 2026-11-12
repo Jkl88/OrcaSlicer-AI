@@ -6,7 +6,7 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.1.0"
+# version = "1.2.0"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
@@ -23,6 +23,7 @@ selection itself (begin_update/commit, which must not run on the GUI thread)
 runs on one plugin-owned worker at a time.
 """
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -60,6 +61,7 @@ MAX_HTTP_WORKERS = 8
 MAX_CONCURRENT_DECODES = 2
 REQUEST_TIMEOUT = 10.0
 CODE_RE = re.compile(r'^FQ-[0-9A-F]{6}$')
+COLOUR_RE = re.compile(r'^#[0-9A-F]{6}$')
 
 ACTIVE_STATUSES = ('queued', 'manual', 'needs_attention', 'cancelled')
 SELECT_JOIN_TIMEOUT = 3.0
@@ -68,6 +70,14 @@ PERMISSION_TEXT = 'OrcaSlicer заблокировал сетевой досту
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def normalize_colour(text):
+    """'' or an upper-case #RRGGBB; anything else is rejected."""
+    colour = str(text or '').strip().upper()
+    if colour and not COLOUR_RE.match(colour):
+        raise ValueError('Цвет должен быть в формате #RRGGBB')
+    return colour
 
 
 def normalize_code(text):
@@ -102,12 +112,17 @@ def qr_svg(spool):
         f'<rect x="{x0 + ix * step:.4f}" y="{y0 + iy * step:.4f}" width="{step + .008:.4f}" height="{step + .008:.4f}"/>'
         for iy, row in enumerate(matrix) for ix, dark in enumerate(row) if dark)
     cy = y0 + size / 2
+    colour = normalize_colour(spool.get('color', ''))
+    swatch = (f'<g class="swatch"><circle cx="47.5" cy="6.2" r="3.3" fill="{colour}" stroke="#111" '
+              f'stroke-width=".35"/><text x="47.5" y="12" text-anchor="middle" font-family="Arial,sans-serif" '
+              f'font-size="1.9" fill="#333">{colour}</text></g>') if colour else ''
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="56mm" height="72mm" viewBox="0 0 56 72">'
         '<rect width="56" height="72" fill="white"/>'
         '<rect x="0.5" y="0.5" width="55" height="71" rx="2" fill="none" stroke="#303644" stroke-width=".35"/>'
         '<text x="28" y="5.5" text-anchor="middle" font-family="Arial,sans-serif" font-size="3.5" '
         'font-weight="bold" fill="#111">FILAMENT QR</text>'
+        f'{swatch}'
         f'<text x="28" y="10" text-anchor="middle" font-family="Arial,sans-serif" font-size="3.2" '
         f'fill="#333">{escape((brand or title)[:26])}</text>'
         f'<g fill="#111">{rects}</g>'
@@ -134,7 +149,7 @@ def label_page(spool):
 
 # --------------------------------------------------------------------------- store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Store:
@@ -180,6 +195,10 @@ class Store:
                     created TEXT NOT NULL, updated TEXT NOT NULL)''')
                 db.execute('CREATE INDEX IF NOT EXISTS pending_status ON pending_scans(status, id)')
                 db.execute('PRAGMA user_version = 1')
+            if version < 2:
+                db.execute("ALTER TABLE spools ADD COLUMN color TEXT NOT NULL DEFAULT ''")
+                db.execute("ALTER TABLE pending_scans ADD COLUMN color TEXT NOT NULL DEFAULT ''")
+                db.execute('PRAGMA user_version = 2')
 
     # spools
 
@@ -193,8 +212,9 @@ class Store:
             row = db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone()
             return dict(row) if row else None
 
-    def add_spool(self, profile, printer, material, brand='', notes='', token=None):
+    def add_spool(self, profile, printer, material, brand='', notes='', token=None, color=''):
         profile, printer = str(profile).strip(), str(printer).strip()
+        color = normalize_colour(color)
         material, brand, notes = str(material).strip() or 'FILAMENT', str(brand).strip(), str(notes).strip()
         if not profile:
             raise ValueError('Выберите профиль филамента')
@@ -205,8 +225,9 @@ class Store:
             for _ in range(20):
                 code = 'FQ-' + token()
                 try:
-                    db.execute('INSERT INTO spools VALUES (?,?,?,?,?,?,?)',
-                               (code, profile, printer, material, brand, notes, utc_now()))
+                    db.execute('INSERT INTO spools (code, profile, printer, material, brand, notes, created, color) '
+                               'VALUES (?,?,?,?,?,?,?,?)',
+                               (code, profile, printer, material, brand, notes, utc_now(), color))
                 except sqlite3.IntegrityError:
                     continue
                 return dict(db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone())
@@ -225,8 +246,9 @@ class Store:
             raise LookupError('Катушка с этим кодом не найдена')
         now = utc_now()
         with self._db() as db:
-            cur = db.execute('INSERT INTO pending_scans (code, profile, slot, status, created, updated) '
-                             'VALUES (?,?,?,?,?,?)', (spool['code'], spool['profile'], int(slot), status, now, now))
+            cur = db.execute('INSERT INTO pending_scans (code, profile, slot, status, created, updated, color) '
+                             'VALUES (?,?,?,?,?,?,?)',
+                             (spool['code'], spool['profile'], int(slot), status, now, now, spool['color']))
             return dict(db.execute('SELECT * FROM pending_scans WHERE id=?', (cur.lastrowid,)).fetchone())
 
     def get_pending(self, pending_id):
@@ -368,15 +390,25 @@ class DecodeError(ValueError):
     pass
 
 
+def decoder_error():
+    """'' when Pillow and zxing-cpp import, otherwise the real import failure for the user."""
+    try:
+        for module in ('PIL.Image', 'PIL.ImageOps', 'zxingcpp'):
+            importlib.import_module(module)
+    except Exception as exc:
+        return f'{type(exc).__name__}: {exc}'[:300]
+    return ''
+
+
 def decode_qr_image(data):
     """Return the normalized FQ codes found in an image, rejecting oversized input before decoding."""
     if len(data) > MAX_IMAGE_BYTES:
         raise DecodeError('Изображение слишком большое')
-    try:
-        from PIL import Image, ImageOps
-        import zxingcpp
-    except ImportError as exc:
-        raise DecodeError('Распознавание фото недоступно: не установлены Pillow/zxing-cpp') from exc
+    reason = decoder_error()
+    if reason:
+        raise DecodeError(f'Распознавание фото недоступно ({reason}). Введите код с этикетки вручную')
+    from PIL import Image, ImageOps
+    import zxingcpp
 
     with warnings.catch_warnings():
         warnings.simplefilter('error', Image.DecompressionBombWarning)
@@ -417,6 +449,7 @@ def decode_qr_image(data):
 class HostCapabilities:
     mode: str                      # 'automatic' | 'manual'
     storage: bool
+    colour: bool = False           # the host can set a slot's colour (preset.filament.set_slot_colour)
 
     @classmethod
     def discover(cls, orca_module):
@@ -424,7 +457,8 @@ class HostCapabilities:
         editor = getattr(getattr(host, 'preset', None), 'filament', None)
         automatic = callable(getattr(host, 'preset_bundle', None)) and callable(getattr(editor, 'begin_update', None))
         storage = callable(getattr(getattr(host, 'plugin', None), 'storage', None))
-        return cls('automatic' if automatic else 'manual', storage)
+        colour = automatic and callable(getattr(editor, 'set_slot_colour', None))
+        return cls('automatic' if automatic else 'manual', storage, colour)
 
 
 @dataclass
@@ -433,6 +467,19 @@ class WorkspaceState:
     slots: list = field(default_factory=list)      # preset name per zero-based slot
     profiles: list = field(default_factory=list)   # compatible, visible filament presets
     dirty: bool = False
+    colours: list = field(default_factory=list)    # #RRGGBB per zero-based slot, [] when unknown
+
+
+def slot_colours(bundle):
+    read = getattr(bundle, 'full_config_value', None)
+    raw = read('filament_colour') if callable(read) else None
+    colours = []
+    for item in str(raw or '').split(';') if raw else []:
+        try:
+            colours.append(normalize_colour(item.strip().strip('"')))
+        except ValueError:
+            colours.append('')
+    return colours
 
 
 def read_workspace(host, caps):
@@ -448,7 +495,8 @@ def read_workspace(host, caps):
     return WorkspaceState(printer=str(bundle.printers.selected_preset_name()),
                           slots=list(bundle.current_filament_preset_names()),
                           profiles=profiles,
-                          dirty=bool(edited.is_dirty) if edited else False)
+                          dirty=bool(edited.is_dirty) if edited else False,
+                          colours=slot_colours(bundle))
 
 
 CANCELLED_TEXT = 'Отменено в OrcaSlicer — можно повторить'
@@ -467,7 +515,9 @@ def prepare_pending(host, store, pending, caps):
     if slot >= len(ws.slots):
         store.mark(pid, 'needs_attention', f'У принтера нет слота {slot + 1}')
         return 'needs_attention'
-    if ws.slots[slot] == profile:
+    colour = pending.get('color', '')
+    current_colour = ws.colours[slot] if slot < len(ws.colours) else ''
+    if ws.slots[slot] == profile and not (caps.colour and colour and colour != current_colour):
         store.mark(pid, 'done', 'Профиль уже выбран')
         return 'done'
     if profile not in ws.profiles:
@@ -479,15 +529,19 @@ def prepare_pending(host, store, pending, caps):
     return 'select'
 
 
-def select_in_slot(host, slot, profile, current):
-    """Confirm and select profile into zero-based slot that now holds current. Must not run on the GUI
-    thread. Returns (status, message) for the store."""
-    question = (f'Выбрать профиль филамента?\n\nСлот {slot + 1}: «{current}» → «{profile}»\n\n'
-                'Запрос пришёл со сканера Filament QR.')
+def select_in_slot(host, slot, profile, current, colour=''):
+    """Confirm and select profile (and, when the host supports it, colour) into zero-based slot that now
+    holds current. Must not run on the GUI thread. Returns (status, message) for the store."""
+    editor = host.preset.filament
+    set_colour = getattr(editor, 'set_slot_colour', None) if colour else None
+    question = f'Выбрать профиль филамента?\n\nСлот {slot + 1}: «{current}» → «{profile}»'
+    if colour:
+        question += f'\nЦвет: {colour}' + ('' if callable(set_colour) else ' (задайте в слоте вручную)')
+    question += '\n\nЗапрос пришёл со сканера Filament QR.'
     if host.ui.message(question, title='Filament QR', buttons='yes_no', icon='question') != 'yes':
         return 'cancelled', CANCELLED_TEXT
     try:
-        transaction = host.preset.filament.begin_update(slot + 1, profile)
+        transaction = editor.begin_update(slot + 1, profile)
     except RuntimeError:
         return 'cancelled', CANCELLED_TEXT
     except ValueError as exc:
@@ -500,7 +554,15 @@ def select_in_slot(host, slot, profile, current):
         return 'needs_attention', 'Состояние OrcaSlicer изменилось во время выбора — повторите'
     if transaction.target_name != profile:
         return 'needs_attention', 'OrcaSlicer выбрал другой профиль'
-    return 'done', 'Профиль выбран'
+    if not colour:
+        return 'done', 'Профиль выбран'
+    if not callable(set_colour):
+        return 'done', f'Профиль выбран. Цвет {colour} задайте в слоте вручную'
+    try:
+        set_colour(slot + 1, colour)
+    except Exception as exc:
+        return 'needs_attention', f'Профиль выбран, но цвет {colour} не установлен: {exc}'
+    return 'done', f'Профиль и цвет {colour} выбраны'
 
 
 # --------------------------------------------------------------------------- shared service state
@@ -835,6 +897,8 @@ class Controller:
         self._lock = threading.Lock()
         self._closed = False
         self._selecting = None
+        # Imported here, on the GUI thread during on_load, so request threads reuse the loaded modules.
+        self.decoder_error = decoder_error()
         if self.data_dir is not None:
             self.store = Store(self.data_dir / 'filament_qr.sqlite3')
             self.settings = Settings(self.data_dir / 'settings.json')
@@ -902,13 +966,13 @@ class Controller:
         return changed
 
     def _start_selection(self, pending):
-        pid, slot, profile = pending['id'], int(pending['slot']), pending['profile']
+        pid, slot, profile, colour = pending['id'], int(pending['slot']), pending['profile'], pending.get('color', '')
         slots = self.refresh_workspace().slots
         current = slots[slot] if slot < len(slots) else ''
 
         def run():
             try:
-                status, message = select_in_slot(self.host, slot, profile, current)
+                status, message = select_in_slot(self.host, slot, profile, current, colour)
             except Exception as exc:
                 status, message = 'needs_attention', f'Ошибка OrcaSlicer при выборе профиля: {exc}'
             with self._lock:
@@ -921,7 +985,8 @@ class Controller:
     def state(self, ws=None):
         ws = ws or self.refresh_workspace()
         base = {'mode': self.caps.mode, 'available': self.available, 'printer': ws.printer, 'slots': ws.slots,
-                'profiles': ws.profiles, 'dirty': ws.dirty}
+                'profiles': ws.profiles, 'dirty': ws.dirty, 'colours': ws.colours, 'colour_api': self.caps.colour,
+                'decoder_error': self.decoder_error}
         if not self.available:
             return base
         address = self.server.address
@@ -958,7 +1023,7 @@ class Controller:
             if profile not in ws.profiles:
                 raise ValueError('Профиль недоступен для текущего принтера')
             spool = self.store.add_spool(profile, ws.printer, data.get('material', ''), data.get('brand', ''),
-                                         data.get('notes', ''))
+                                         data.get('notes', ''), color=data.get('color', ''))
             out += [{'type': 'created', 'spool': spool}, self.label(spool['code'])]
         elif kind == 'delete':
             self.store.delete_spool(data.get('code', ''))
@@ -1007,7 +1072,7 @@ input,select,button{font:inherit;border-radius:10px;padding:12px;border:1px soli
 input,select{background:#0e1420;color:#fff}button{background:#568bff;color:#fff;font-weight:700;border:0}
 button.secondary{background:#2b3444}.error{color:#ff8e89}.ok{color:#93f1a8}.row{border-bottom:1px solid #3a4455;padding:10px 0}
 label.camera{display:block;text-align:center;background:#568bff;border-radius:10px;padding:12px;font-weight:700}
-#photo{display:none}a{color:#adc8ff}
+#photo{display:none}a{color:#adc8ff}.sw{display:inline-block;width:16px;height:16px;border-radius:50%;border:1px solid #889;vertical-align:middle;margin-right:6px}
 </style><main><h1>🧵 Filament QR</h1><p>Выбор катушки для OrcaSlicer</p>
 <section id="login"><h2>Вход</h2><p>Введите PIN со страницы Filament QR в OrcaSlicer.</p>
 <input id="pin" inputmode="numeric" maxlength="6" placeholder="6 цифр"><button id="enter">Войти</button><p id="loginmsg" class="error"></p></section>
@@ -1030,14 +1095,15 @@ $('scan').onclick=async()=>{try{const d=await call('/api/scan',{code:$('code').v
 $('photo').onchange=async()=>{const f=$('photo').files&&$('photo').files[0];if(!f)return;say('Распознаём QR…',true);
  try{const d=await call('/api/decode?slot='+slot(),f,true);say('Отправлено в OrcaSlicer: '+d.pending.profile,true);await load()}catch(e){say(e.message,false)}finally{$('photo').value=''}};
 function text(tag,t){const e=document.createElement(tag);e.textContent=t;return e}
+function swatch(c){const e=document.createElement('span');e.className='sw';if(c){e.style.background=c}else{e.style.visibility='hidden'}return e}
 async function load(){let d;try{d=await call('/api/status')}catch(e){if(e.status===401)showApp(false);return}
  showApp(true);$('printer').textContent=d.printer?'Принтер: '+d.printer:'';
  const keep=$('slot').value;$('slot').replaceChildren();(d.slots.length?d.slots:['']).forEach((name,i)=>{const o=text('option','Слот '+(i+1)+(name?' — '+name:''));o.value=i;$('slot').append(o)});if(keep)$('slot').value=keep;
- $('queue').replaceChildren();for(const p of d.pending){const r=document.createElement('div');r.className='row';r.append(text('b',p.code+' → слот '+(p.slot+1)),text('div',p.profile),text('small',p.message||p.status));$('queue').append(r)}
+ $('queue').replaceChildren();for(const p of d.pending){const r=document.createElement('div');r.className='row';const h=text('b','');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1));r.append(h,text('div',p.profile),text('small',p.message||p.status));$('queue').append(r)}
  for(const p of d.recent){const r=document.createElement('div');r.className='row';r.append(text('span','✓ '+p.profile+' → слот '+(p.slot+1)));$('queue').append(r)}
  if(!d.pending.length&&!d.recent.length)$('queue').append(text('p','Пусто'));
  $('spools').replaceChildren();for(const s of d.spools){const r=document.createElement('div');r.className='row';const a=text('a','Этикетка');a.href='/label/'+encodeURIComponent(s.code);a.target='_blank';
-  r.append(text('b',s.code+' · '+s.material+(s.brand?' · '+s.brand:'')),text('div',s.profile),a);$('spools').append(r)}}
+  const h=text('b','');h.append(swatch(s.color),s.code+' · '+s.material+(s.brand?' · '+s.brand:''));r.append(h,text('div',s.profile),a);$('spools').append(r)}}
 load();setInterval(()=>{if(!$('app').hidden)load()},3000);
 </script></html>'''
 
@@ -1048,13 +1114,14 @@ section{border:1px solid var(--orca-border,#666);border-radius:10px;padding:14px
 select,input,button{font:inherit;padding:7px;margin:4px 0;border-radius:6px;max-width:100%}select,input{width:100%;background:transparent;color:inherit;border:1px solid var(--orca-border,#888)}
 option{color:#000}button{background:var(--orca-accent,#4a89e8);color:var(--orca-accent-fg,#fff);border:0;cursor:pointer}button.secondary{background:transparent;color:inherit;border:1px solid var(--orca-border,#888)}
 .row{border-bottom:1px solid var(--orca-border,#555);padding:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row .grow{flex:1;min-width:200px}
-.warn{color:#e6a756}.err{color:#ff8e89}.ok{color:#8fe3a0}.muted{opacity:.75}.pin{font-size:26px;font-weight:700;letter-spacing:4px}
+.sw{display:inline-block;width:14px;height:14px;border-radius:50%;border:1px solid #888;vertical-align:middle;margin-right:6px}.warn{color:#e6a756}.err{color:#ff8e89}.ok{color:#8fe3a0}.muted{opacity:.75}.pin{font-size:26px;font-weight:700;letter-spacing:4px}
 #label svg{width:220px;background:#fff}code{user-select:all}
 </style><h1>🧵 Filament QR</h1><div id="banner"></div>
 <div class="grid"><section><h2>Новая катушка</h2>
 <label>Профиль филамента</label><select id="profile"></select>
 <label>Материал</label><input id="material" maxlength="40" placeholder="PLA / PETG / ABS">
-<label>Производитель, цвет</label><input id="brand" maxlength="80" placeholder="eSUN, чёрный">
+<label>Производитель</label><input id="brand" maxlength="80" placeholder="eSUN">
+<label>Цвет катушки</label><input id="color" type="color" value="#ffffff" style="width:80px;height:36px;padding:2px">
 <label>Заметка</label><input id="notes" maxlength="300">
 <button id="add">Создать катушку и этикетку</button><p id="status"></p><div id="label"></div></section>
 <section><h2>Телефон</h2><div id="phone"></div>
@@ -1069,8 +1136,9 @@ let S={};const $=id=>document.getElementById(id);
 function post(type,data){orca.postMessage(Object.assign({type},data||{}))}
 function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
 function btn(text,fn,cls){const b=el('button',text,cls);b.onclick=fn;return b}
+function swatch(c){const e=el('span',undefined,'sw');if(c){e.style.background=c;e.title=c}else{e.style.visibility='hidden'}return e}
 function slotSelect(){const s=el('select');(S.slots&&S.slots.length?S.slots:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
-$('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,notes:$('notes').value});
+$('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,color:$('color').value,notes:$('notes').value});
 $('applyLan').onclick=()=>post('set_lan',{enabled:$('lan').checked,port:parseInt($('port').value,10)});
 $('rotate').onclick=()=>post('rotate_pin');$('revoke').onclick=()=>post('revoke_sessions');
 const STATUS={queued:'в очереди',manual:'выберите вручную',needs_attention:'нужно внимание',cancelled:'отменено'};
@@ -1078,6 +1146,8 @@ function render(s){S=s;
  const b=$('banner');b.replaceChildren();
  if(!s.available)b.append(el('p','Хранилище плагина недоступно: нужен OrcaSlicer 2.5.0 или новее.','err'));
  else if(s.mode!=='automatic')b.append(el('p','Режим без автоматического выбора: после сканирования выберите показанный профиль в слоте вручную.','warn'));
+ if(s.decoder_error)b.append(el('p','Распознавание фото недоступно: '+s.decoder_error+'. Коды с этикеток можно вводить вручную.','err'));
+ if(s.mode==='automatic'&&!s.colour_api)b.append(el('p','Эта версия OrcaSlicer не даёт плагинам менять цвет слота: после выбора задайте цвет катушки в слоте вручную.','muted'));
  b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slots||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
  const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;
  if(!s.available)return;
@@ -1088,12 +1158,12 @@ function render(s){S=s;
  const pin=el('p','PIN: ');pin.append(el('span',s.pin,'pin'));ph.append(pin);ph.append(el('p','Подключённых телефонов: '+s.sessions,'muted'));
  if(document.activeElement!==$('port'))$('port').value=s.port;if(document.activeElement!==$('lan'))$('lan').checked=s.lan_enabled;
  const q=$('queue');q.replaceChildren();
- for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');t.append(el('b',p.code+' → слот '+(p.slot+1)+': '+p.profile));t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
+ for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1)+': '+p.profile);t.append(h);t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
   r.append(t,btn('Повторить',()=>post('retry',{id:p.id})),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));q.append(r)}
  for(const p of s.recent){q.append(el('div','✓ '+p.profile+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
  if(!s.pending.length&&!s.recent.length)q.append(el('p','Пусто','muted'));
  const sp=$('spools');sp.replaceChildren();
- for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');t.append(el('b',item.code+' · '+item.material+(item.brand?' · '+item.brand:'')));t.append(el('div',item.profile,'muted'));
+ for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:''));t.append(h);t.append(el('div',item.profile,'muted'));
   const sel=slotSelect();r.append(t,sel,btn('Выбрать',()=>post('use',{code:item.code,slot:parseInt(sel.value,10)})),btn('Этикетка',()=>post('label',{code:item.code}),'secondary'),
   btn('Удалить',()=>{if(confirm('Удалить катушку '+item.code+'?'))post('delete',{code:item.code})},'secondary'));sp.append(r)}
  if(!s.spools.length)sp.append(el('p','Катушек пока нет','muted'))}
