@@ -1,12 +1,19 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["qrcode>=7.4,<9", "Pillow>=10,<13", "zxing-cpp>=2.3,<4"]
+# # zxing-cpp 3.x has only stable-ABI (abi3) wheels for Python 3.12; they need python3.dll, which
+# # OrcaSlicer 2.5.0 for Windows does not ship, so Windows x64 stays on the cp312 wheels of 2.3.
+# dependencies = [
+#     "qrcode>=7.4,<9",
+#     "Pillow>=10,<13",
+#     "zxing-cpp>=2.3,<3; sys_platform == 'win32' and platform_machine == 'AMD64'",
+#     "zxing-cpp>=2.3,<4; sys_platform != 'win32' or platform_machine != 'AMD64'",
+# ]
 #
 # [tool.orcaslicer.plugin]
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.3.0"
+# version = "1.3.1"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 

@@ -7,7 +7,7 @@
 
 ## Установка
 
-Плагин версионируется отдельно от OrcaSlicer, текущая версия — 1.3.0. Нужен официальный OrcaSlicer 2.5.0 или новее.
+Плагин версионируется отдельно от OrcaSlicer, текущая версия — 1.3.1. Нужен официальный OrcaSlicer 2.5.0 или новее.
 
 1. Скачайте `orca_filament_qr.py` из раздела Releases этого репозитория.
 2. Подготовьте OrcaSlicer 2.5.0 или новее с [официальной страницы](https://github.com/SoftFever/OrcaSlicer/releases).
@@ -60,6 +60,11 @@
 `ImportError: DLL load failed ...`). Пришлите этот текст разработчику. Пока распознавание недоступно, код с этикетки
 можно ввести вручную.
 
+`ImportError: DLL load failed while importing zxingcpp` в версиях до 1.3.1 на Windows: OrcaSlicer 2.5.0 не кладёт
+`python3.dll`, без которой не загружается zxing-cpp 3.x. С версии 1.3.1 на Windows x64 ставится zxing-cpp 2.3, которой
+эта библиотека не нужна: переустановите плагин, OrcaSlicer заменит пакет. На Windows ARM64 подходящей сборки
+zxing-cpp нет, там коды вводятся вручную.
+
 ## Безопасность
 
 - Сервер по умолчанию слушает только `127.0.0.1`. Доступ из сети включается вручную.
@@ -77,7 +82,7 @@
 ## Разработка
 
 ```bash
-python3 -m pip install "qrcode>=7.4,<9" "Pillow>=10,<13" "zxing-cpp>=2.3,<4"
+python3 -m pip install "qrcode>=7.4,<9" "Pillow>=10,<13" "zxing-cpp>=2.3,<4"  # на Windows x64: "zxing-cpp>=2.3,<3"
 python3 -m unittest discover -s plugins/filament_qr/tests -t plugins/filament_qr -v
 # сервер для телефона без OrcaSlicer:
 python3 plugins/filament_qr/orca_filament_qr.py --data /tmp/fq

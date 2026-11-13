@@ -1,4 +1,5 @@
 import io
+import re
 import sys
 import unittest
 from unittest import mock
@@ -110,3 +111,32 @@ class PageTest(unittest.TestCase):
 
     def test_phone_page_shows_spool_colour(self):
         self.assertIn('swatch(', fq.PHONE_HTML)
+
+
+class DependencyPinTest(unittest.TestCase):
+    """OrcaSlicer 2.5.0 for Windows ships no python3.dll, so stable-ABI (abi3) wheels cannot load there."""
+
+    def requirements(self, environment):
+        from pip._vendor.packaging.requirements import Requirement
+        header = fq.__file__ and open(fq.__file__, encoding='utf-8').read().split('# ///', 2)[1]
+        specs = re.findall(r'"([^"]+)"', header.split('dependencies', 1)[1].split(']', 1)[0])
+        env = {'sys_platform': 'linux', 'platform_machine': 'x86_64', 'python_version': '3.12',
+               'python_full_version': '3.12.13', 'os_name': 'posix', 'platform_system': 'Linux',
+               'implementation_name': 'cpython', 'platform_python_implementation': 'CPython'}
+        env.update(environment)
+        reqs = [Requirement(spec) for spec in specs]
+        return {r.name: r.specifier for r in reqs if r.marker is None or r.marker.evaluate(env)}
+
+    def test_windows_x64_gets_a_version_specific_zxing_wheel(self):
+        reqs = self.requirements({'sys_platform': 'win32', 'platform_machine': 'AMD64', 'os_name': 'nt',
+                                  'platform_system': 'Windows'})
+        self.assertIn('2.3.0', reqs['zxing-cpp'])
+        self.assertNotIn('3.1.1', reqs['zxing-cpp'])
+        self.assertEqual(set(reqs), {'qrcode', 'Pillow', 'zxing-cpp'})
+
+    def test_other_platforms_keep_current_zxing(self):
+        for env in ({'sys_platform': 'linux', 'platform_machine': 'aarch64'},
+                    {'sys_platform': 'darwin', 'platform_machine': 'arm64'},
+                    {'sys_platform': 'win32', 'platform_machine': 'ARM64'}):
+            with self.subTest(env=env):
+                self.assertIn('3.1.1', self.requirements(env)['zxing-cpp'])
