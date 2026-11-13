@@ -28,9 +28,9 @@
     {
       "id": "filament_qr",
       "file": "plugins/filament_qr/orca_filament_qr.py",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "min_host": "2.5.0",
-      "sha256": "ad3c8f3bce488ddc7409fc17ef836ecbb82d281801dc7131ad26b115247a94ac",
+      "sha256": "fb974a02073175548fc4a8b267037a5cd6cf1ea246016a2504d270d0ea68dd98",
       "platforms": {
         "windows-x64": "not-tested",
         "linux-x64": "not-tested",

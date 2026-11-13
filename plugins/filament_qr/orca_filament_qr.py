@@ -13,7 +13,7 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.5.0"
+# version = "1.5.1"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
@@ -616,6 +616,18 @@ def bare_profile_name(name):
     return ' '.join(name.split())
 
 
+def display_profile_name(name):
+    """The name OrcaSlicer shows: a bundle profile appears without its _local/<bundle>/ folder."""
+    name = str(name)
+    if name.startswith(('_local/', '_subscribed/')) and name.count('/') >= 2:
+        return name.split('/', 2)[2]
+    return name
+
+
+def _labelled(rows):
+    return [dict(row, profile_label=display_profile_name(row['profile'])) for row in rows]
+
+
 def spool_profile_name(code, base):
     return f'{BUNDLE_PREFIX}{normalize_code(code)} {bare_profile_name(base)}'
 
@@ -753,7 +765,8 @@ def prepare_pending(host, store, pending, caps):
         store.mark(pid, 'needs_attention', f'У принтера нет слота {slot + 1}')
         return 'needs_attention'
     if ws.all_profiles and profile not in ws.all_profiles:
-        store.mark(pid, 'needs_attention', f'Профиль «{profile}» не найден — удалите этикетку {pending["code"]}')
+        store.mark(pid, 'needs_attention',
+                   f'Профиль «{display_profile_name(profile)}» не найден — удалите этикетку {pending["code"]}')
         return 'needs_attention'
     colour = pending.get('color', '')
     current_colour = ws.colours[slot] if slot < len(ws.colours) else ''
@@ -764,7 +777,7 @@ def prepare_pending(host, store, pending, caps):
         store.mark(pid, 'needs_attention', 'Профиль отсутствует или не совместим с текущим принтером')
         return 'needs_attention'
     if caps.mode != 'automatic':
-        store.mark(pid, 'manual', f'Выберите «{profile}» в слоте {slot + 1} вручную')
+        store.mark(pid, 'manual', f'Выберите «{display_profile_name(profile)}» в слоте {slot + 1} вручную')
         return 'manual'
     return 'select'
 
@@ -774,7 +787,8 @@ def select_in_slot(host, slot, profile, current, colour=''):
     holds current. Must not run on the GUI thread. Returns (status, message) for the store."""
     editor = host.preset.filament
     set_colour = getattr(editor, 'set_slot_colour', None) if colour else None
-    question = f'Выбрать профиль филамента?\n\nСлот {slot + 1}: «{current}» → «{profile}»'
+    question = (f'Выбрать профиль филамента?\n\nСлот {slot + 1}: «{display_profile_name(current)}» → '
+                f'«{display_profile_name(profile)}»')
     if colour:
         question += f'\nЦвет: {colour}' + ('' if callable(set_colour) else ' (задайте в слоте вручную)')
     question += '\n\nЗапрос пришёл со сканера Filament QR.'
@@ -841,9 +855,9 @@ class Service:
 
     def phone_status(self):
         ws = self.workspace()
-        return {'printer': ws.printer, 'slots': ws.slots,
-                'pending': self.store.list_pending(), 'recent': self.store.recent_done(),
-                'spools': self.store.list_spools()}
+        return {'printer': ws.printer, 'slots': [display_profile_name(n) for n in ws.slots],
+                'pending': _labelled(self.store.list_pending()), 'recent': _labelled(self.store.recent_done()),
+                'spools': _labelled(self.store.list_spools())}
 
 
 # --------------------------------------------------------------------------- LAN server
@@ -1238,7 +1252,9 @@ class Controller:
     def state(self, ws=None):
         ws = ws or self.refresh_workspace()
         base = {'mode': self.caps.mode, 'available': self.available, 'printer': ws.printer, 'slots': ws.slots,
-                'profiles': ws.profiles, 'dirty': ws.dirty, 'colours': ws.colours, 'colour_api': self.caps.colour,
+                'profiles': ws.profiles, 'dirty': ws.dirty,
+                'profile_options': [{'name': n, 'label': display_profile_name(n)} for n in ws.profiles],
+                'slot_labels': [display_profile_name(n) for n in ws.slots], 'colours': ws.colours, 'colour_api': self.caps.colour,
                 'decoder_error': self.decoder_error}
         if not self.available:
             return base
@@ -1246,11 +1262,12 @@ class Controller:
         port = address[1] if address else self.settings.port
         urls = [f'http://{h}:{port}/' for h in self.hosts] if address else []
         known = set(ws.all_profiles)
-        spools = [dict(s, missing=bool(known) and s['profile'] not in known) for s in self.store.list_spools()]
+        spools = [dict(s, missing=bool(known) and s['profile'] not in known) for s in _labelled(self.store.list_spools())]
         base.update({
             'spools': spools,
-            'pending': [dict(p, missing=bool(known) and p['profile'] not in known) for p in self.store.list_pending()],
-            'recent': self.store.recent_done(),
+            'pending': [dict(p, missing=bool(known) and p['profile'] not in known)
+                        for p in _labelled(self.store.list_pending())],
+            'recent': _labelled(self.store.recent_done()),
             'lan_enabled': self.settings.lan_enabled,
             'port': port,
             'urls': urls,
@@ -1312,7 +1329,8 @@ class Controller:
             spool = self.store.get_spool(data.get('code', ''))
             known = self.refresh_workspace().all_profiles
             if spool is not None and known and spool['profile'] not in known:
-                return [{'type': 'profile_missing', 'code': spool['code'], 'profile': spool['profile']}]
+                return [{'type': 'profile_missing', 'code': spool['code'], 'profile': spool['profile'],
+                         'label': display_profile_name(spool['profile'])}]
             self.service.scan(data.get('code', ''), data.get('slot', 0))
             self.process_queue()
         elif kind == 'retry':
@@ -1374,19 +1392,20 @@ function showApp(on){$('login').hidden=on;$('app').hidden=!on}
 function slot(){return parseInt($('slot').value||'0',10)}
 $('enter').onclick=async()=>{try{await call('/api/auth',{pin:$('pin').value});showApp(true);await load()}catch(e){$('loginmsg').textContent=e.message}};
 $('logout').onclick=async()=>{try{await call('/api/logout',{})}catch(e){}showApp(false)};
-$('scan').onclick=async()=>{try{const d=await call('/api/scan',{code:$('code').value,slot:slot()});say('Отправлено в OrcaSlicer: '+d.pending.profile,true);$('code').value='';await load()}catch(e){say(e.message,false)}};
+$('scan').onclick=async()=>{try{const d=await call('/api/scan',{code:$('code').value,slot:slot()});say('Отправлено в OrcaSlicer: '+label(d.pending.profile),true);$('code').value='';await load()}catch(e){say(e.message,false)}};
 $('photo').onchange=async()=>{const f=$('photo').files&&$('photo').files[0];if(!f)return;say('Распознаём QR…',true);
- try{const d=await call('/api/decode?slot='+slot(),f,true);say('Отправлено в OrcaSlicer: '+d.pending.profile,true);await load()}catch(e){say(e.message,false)}finally{$('photo').value=''}};
+ try{const d=await call('/api/decode?slot='+slot(),f,true);say('Отправлено в OrcaSlicer: '+label(d.pending.profile),true);await load()}catch(e){say(e.message,false)}finally{$('photo').value=''}};
 function text(tag,t){const e=document.createElement(tag);e.textContent=t;return e}
+function label(n){return String(n||'').replace(/^_(local|subscribed)\/[^/]+\//,'')}
 function swatch(c){const e=document.createElement('span');e.className='sw';if(c){e.style.background=c}else{e.style.visibility='hidden'}return e}
 async function load(){let d;try{d=await call('/api/status')}catch(e){if(e.status===401)showApp(false);return}
  showApp(true);$('printer').textContent=d.printer?'Принтер: '+d.printer:'';
  const keep=$('slot').value;$('slot').replaceChildren();(d.slots.length?d.slots:['']).forEach((name,i)=>{const o=text('option','Слот '+(i+1)+(name?' — '+name:''));o.value=i;$('slot').append(o)});if(keep)$('slot').value=keep;
- $('queue').replaceChildren();for(const p of d.pending){const r=document.createElement('div');r.className='row';const h=text('b','');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1));r.append(h,text('div',p.profile),text('small',p.message||p.status));$('queue').append(r)}
- for(const p of d.recent){const r=document.createElement('div');r.className='row';r.append(text('span','✓ '+p.profile+' → слот '+(p.slot+1)));$('queue').append(r)}
+ $('queue').replaceChildren();for(const p of d.pending){const r=document.createElement('div');r.className='row';const h=text('b','');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1));r.append(h,text('div',p.profile_label),text('small',p.message||p.status));$('queue').append(r)}
+ for(const p of d.recent){const r=document.createElement('div');r.className='row';r.append(text('span','✓ '+p.profile_label+' → слот '+(p.slot+1)));$('queue').append(r)}
  if(!d.pending.length&&!d.recent.length)$('queue').append(text('p','Пусто'));
  $('spools').replaceChildren();for(const s of d.spools){const r=document.createElement('div');r.className='row';const a=text('a','Этикетка');a.href='/label/'+encodeURIComponent(s.code);a.target='_blank';
-  const h=text('b','');h.append(swatch(s.color),s.code+' · '+s.material+(s.brand?' · '+s.brand:'')+(s.price?' · '+s.price+' за кг':''));r.append(h,text('div',s.profile),a);$('spools').append(r)}}
+  const h=text('b','');h.append(swatch(s.color),s.code+' · '+s.material+(s.brand?' · '+s.brand:'')+(s.price?' · '+s.price+' за кг':''));r.append(h,text('div',s.profile_label),a);$('spools').append(r)}}
 load();setInterval(()=>{if(!$('app').hidden)load()},3000);
 </script></html>'''
 
@@ -1423,7 +1442,7 @@ function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefine
 function btn(text,fn,cls){const b=el('button',text,cls);b.onclick=fn;return b}
 function swatch(c){const e=el('span',undefined,'sw');if(c){e.style.background=c;e.title=c}else{e.style.visibility='hidden'}return e}
 function askDelete(code,after){if(confirm('Удалить этикетку '+code+' и её профиль в OrcaSlicer?')){post('delete',{code});if(after)after()}}
-function slotSelect(){const s=el('select');(S.slots&&S.slots.length?S.slots:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
+function slotSelect(){const s=el('select');(S.slot_labels&&S.slot_labels.length?S.slot_labels:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
 $('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,color:$('color').value,price:$('price').value,notes:$('notes').value});
 let infoFor='';function askProfile(){const p=$('profile').value;if(p&&p!==infoFor){infoFor=p;post('profile_info',{profile:p})}}
 $('profile').onchange=askProfile;
@@ -1436,8 +1455,8 @@ function render(s){S=s;
  else if(s.mode!=='automatic')b.append(el('p','Режим без автоматического выбора: после сканирования выберите показанный профиль в слоте вручную.','warn'));
  if(s.decoder_error)b.append(el('p','Распознавание фото недоступно: '+s.decoder_error+'. Коды с этикеток можно вводить вручную.','err'));
  if(s.mode==='automatic'&&!s.colour_api)b.append(el('p','Эта версия OrcaSlicer не даёт плагинам менять цвет слота: после выбора задайте цвет катушки в слоте вручную.','muted'));
- b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slots||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
- const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;askProfile();
+ b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slot_labels||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
+ const old=$('profile').value;$('profile').replaceChildren();for(const p of s.profile_options||[]){const o=el('option',p.label);o.value=p.name;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;askProfile();
  if(!s.available)return;
  const ph=$('phone');ph.replaceChildren();
  if(s.server_error)ph.append(el('p',s.server_error,'err'));
@@ -1448,19 +1467,19 @@ function render(s){S=s;
  const pin=el('p','PIN: ');pin.append(el('span',s.pin,'pin'));ph.append(pin);ph.append(el('p','Подключённых телефонов: '+s.sessions,'muted'));
  if(document.activeElement!==$('port'))$('port').value=s.port;if(document.activeElement!==$('lan'))$('lan').checked=s.lan_enabled;
  const q=$('queue');q.replaceChildren();
- for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1)+': '+p.profile);t.append(h);t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
+ for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1)+': '+p.profile_label);t.append(h);t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
   if(p.missing)r.append(t,btn('Удалить этикетку',()=>askDelete(p.code,()=>post('dismiss',{id:p.id}))),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));
   else r.append(t,btn('Повторить',()=>post('retry',{id:p.id})),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));q.append(r)}
- for(const p of s.recent){q.append(el('div','✓ '+p.profile+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
+ for(const p of s.recent){q.append(el('div','✓ '+p.profile_label+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
  if(!s.pending.length&&!s.recent.length)q.append(el('p','Пусто','muted'));
  const sp=$('spools');sp.replaceChildren();
- for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:'')+(item.price?' · '+item.price+' за кг':''));t.append(h);if(item.notes)t.append(el('div',item.notes,'muted'));if(item.missing)t.append(el('div','Профиль не найден: '+item.profile,'err'));t.append(el('div',item.profile,'muted'));
+ for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:'')+(item.price?' · '+item.price+' за кг':''));t.append(h);if(item.notes)t.append(el('div',item.notes,'muted'));if(item.missing)t.append(el('div','Профиль не найден: '+item.profile_label,'err'));t.append(el('div',item.profile_label,'muted'));
   const sel=slotSelect();r.append(t,sel,btn('Выбрать',()=>post('use',{code:item.code,slot:parseInt(sel.value,10)})),btn('Этикетка',()=>post('label',{code:item.code}),'secondary'),
   btn('Удалить',()=>askDelete(item.code),'secondary'));sp.append(r)}
  if(!s.spools.length)sp.append(el('p','Катушек пока нет','muted'))}
 orca.onMessage(d=>{if(d.type==='state')render(d.state);
  else if(d.type==='label'){$('label').innerHTML=d.svg;const u=(S.urls&&S.urls.length)?'http://127.0.0.1:'+S.port+'/label/'+d.code:'';$('status').textContent=u?'Печать этикетки: откройте '+u+' в браузере':'';$('status').className='muted'}
- else if(d.type==='profile_missing'){if(confirm('Профиль «'+d.profile+'» не найден в OrcaSlicer. Удалить этикетку '+d.code+'?'))post('delete',{code:d.code})}
+ else if(d.type==='profile_missing'){if(confirm('Профиль «'+(d.label||d.profile)+'» не найден в OrcaSlicer. Удалить этикетку '+d.code+'?'))post('delete',{code:d.code})}
  else if(d.type==='profile_info'){if(d.profile!==$('profile').value)return;$('material').value=d.material;$('brand').value=d.brand;if(d.color)$('color').value=d.color.toLowerCase();$('price').value=d.price?String(d.price):''}
  else if(d.type==='created'){$('status').textContent='Создана катушка '+d.spool.code;$('status').className='ok'}
  else if(d.type==='error'){$('status').textContent='Ошибка: '+d.message;$('status').className='err'}});

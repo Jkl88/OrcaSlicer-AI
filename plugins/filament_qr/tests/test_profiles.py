@@ -116,12 +116,31 @@ class DeleteTest(ProfileTestCase):
         self.assertEqual(self.host.reloads, [])
 
 
+class DisplayNameTest(ProfileTestCase):
+    def test_page_and_dialog_show_the_name_orca_shows(self):
+        self.make()
+        spool = self.create()
+        label = f"{spool['code']} Generic PETG"
+        self.assertEqual(fq.display_profile_name(spool['profile']), label)
+        state = self.controller.handle({'type': 'tick'})[-1]['state']
+        self.assertIn({'name': spool['profile'], 'label': label}, state['profile_options'])
+        self.assertEqual(state['spools'][0]['profile_label'], label)
+        self.controller.handle({'type': 'use', 'code': spool['code'], 'slot': 1})
+        settle(self.controller)
+        text = self.host.dialogs[-1][0]
+        self.assertIn(label, text)
+        self.assertNotIn('_local/', text)
+        self.assertNotIn('_local/', json.dumps(self.controller.handle({'type': 'tick'})[-1]['state']['recent'],
+                                               ensure_ascii=False).replace(spool['profile'], ''))
+
+
 class MissingProfileTest(ProfileTestCase):
     def test_choosing_a_label_without_profile_offers_to_delete_it(self):
         self.make()
         spool = self.controller.store.add_spool('Vanished PLA', 'Printer A', 'PLA')
         [missing] = self.controller.handle({'type': 'use', 'code': spool['code'], 'slot': 0})
-        self.assertEqual(missing, {'type': 'profile_missing', 'code': spool['code'], 'profile': 'Vanished PLA'})
+        self.assertEqual(missing, {'type': 'profile_missing', 'code': spool['code'], 'profile': 'Vanished PLA',
+                                   'label': 'Vanished PLA'})
         self.assertEqual(self.controller.store.list_pending(), [])
         state = self.controller.handle({'type': 'tick'})[-1]['state']
         self.assertTrue(next(s for s in state['spools'] if s['code'] == spool['code'])['missing'])
