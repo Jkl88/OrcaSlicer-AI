@@ -13,7 +13,7 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.3.1"
+# version = "1.4.0"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
@@ -29,10 +29,12 @@ session table. Preset reads happen in Pages callbacks on the GUI thread; the
 selection itself (begin_update/commit, which must not run on the GUI thread)
 runs on one plugin-owned worker at a time.
 """
+import contextlib
 import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -40,6 +42,7 @@ import socket
 import socketserver
 import sqlite3
 import tempfile
+import textwrap
 import threading
 import time
 import warnings
@@ -87,6 +90,23 @@ def normalize_colour(text):
     return colour
 
 
+MAX_PRICE = 1_000_000
+
+
+def normalize_price(value):
+    """Price per kg as a float; '' means unknown (0). Accepts '1 250,5'."""
+    text = str(value if value is not None else '').replace('\u00a0', '').replace(' ', '').replace(',', '.')
+    if not text:
+        return 0.0
+    try:
+        price = float(text)
+    except ValueError:
+        price = -1.0
+    if not math.isfinite(price) or not 0 <= price <= MAX_PRICE:
+        raise ValueError('Цена за кг должна быть числом от 0 до 1 000 000')
+    return round(price, 2)
+
+
 def normalize_code(text):
     text = str(text).strip().upper()
     if text.startswith('FQ:'):
@@ -119,6 +139,8 @@ def qr_svg(spool):
         f'<rect x="{x0 + ix * step:.4f}" y="{y0 + iy * step:.4f}" width="{step + .008:.4f}" height="{step + .008:.4f}"/>'
         for iy, row in enumerate(matrix) for ix, dark in enumerate(row) if dark)
     cy = y0 + size / 2
+    note = ' '.join(str(spool.get('notes', '')).split())
+    bottom_lines = textwrap.wrap(note, 42, max_lines=2, placeholder=' …') if note else [title[:42]]
     colour = normalize_colour(spool.get('color', ''))
     swatch = (f'<g class="swatch"><circle cx="47.5" cy="6.2" r="3.3" fill="{colour}" stroke="#111" '
               f'stroke-width=".35"/><text x="47.5" y="12" text-anchor="middle" font-family="Arial,sans-serif" '
@@ -133,17 +155,15 @@ def qr_svg(spool):
         f'<text x="28" y="10" text-anchor="middle" font-family="Arial,sans-serif" font-size="3.2" '
         f'fill="#333">{escape((brand or title)[:26])}</text>'
         f'<g fill="#111">{rects}</g>'
-        f'<rect x="{28 - 6.2:.2f}" y="{cy - 4.6:.2f}" width="12.4" height="9.2" rx=".9" fill="white" '
-        'stroke="#111" stroke-width=".35"/>'
-        f'<text x="28" y="{cy - 0.9:.2f}" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.9" '
-        f'font-weight="bold" fill="#111">{escape(material)}</text>'
-        f'<text x="28" y="{cy + 2.5:.2f}" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.25" '
-        f'font-weight="bold" fill="#111">{escape(code[3:])}</text>'
-        '<text x="28" y="62.8" text-anchor="middle" font-family="Arial,sans-serif" font-size="4.1" '
-        f'font-weight="bold" fill="#111">{escape(material)} · {escape(code[3:])}</text>'
-        f'<text x="28" y="67.2" text-anchor="middle" font-family="Arial,sans-serif" font-size="2.15" '
-        f'fill="#333">{escape(title[:34])}</text>'
-        '</svg>')
+        f'<g class="centre"><rect x="{28 - 6.6:.2f}" y="{cy - 3.4:.2f}" width="13.2" height="6.8" rx=".9" '
+        'fill="white" stroke="#111" stroke-width=".35"/>'
+        f'<text x="28" y="{cy + 1.05:.2f}" text-anchor="middle" font-family="Arial,sans-serif" font-size="3" '
+        f'font-weight="bold" fill="#111">{escape(code[3:])}</text></g>'
+        '<g class="bottom"><text x="28" y="62.6" text-anchor="middle" font-family="Arial,sans-serif" '
+        f'font-size="4.1" font-weight="bold" fill="#111">{escape(material)}</text>'
+        + ''.join(f'<text x="28" y="{66.4 + 2.7 * i:.1f}" text-anchor="middle" font-family="Arial,sans-serif" '
+                  f'font-size="2.15" fill="#333">{escape(line)}</text>' for i, line in enumerate(bottom_lines))
+        + '</g></svg>')
 
 
 def url_qr_svg(url):
@@ -173,7 +193,7 @@ def label_page(spool):
 
 # --------------------------------------------------------------------------- store
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Store:
@@ -223,6 +243,9 @@ class Store:
                 db.execute("ALTER TABLE spools ADD COLUMN color TEXT NOT NULL DEFAULT ''")
                 db.execute("ALTER TABLE pending_scans ADD COLUMN color TEXT NOT NULL DEFAULT ''")
                 db.execute('PRAGMA user_version = 2')
+            if version < 3:
+                db.execute('ALTER TABLE spools ADD COLUMN price REAL NOT NULL DEFAULT 0')
+                db.execute('PRAGMA user_version = 3')
 
     # spools
 
@@ -236,9 +259,9 @@ class Store:
             row = db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone()
             return dict(row) if row else None
 
-    def add_spool(self, profile, printer, material, brand='', notes='', token=None, color=''):
+    def add_spool(self, profile, printer, material, brand='', notes='', token=None, color='', price=''):
         profile, printer = str(profile).strip(), str(printer).strip()
-        color = normalize_colour(color)
+        color, price = normalize_colour(color), normalize_price(price)
         material, brand, notes = str(material).strip() or 'FILAMENT', str(brand).strip(), str(notes).strip()
         if not profile:
             raise ValueError('Выберите профиль филамента')
@@ -249,9 +272,9 @@ class Store:
             for _ in range(20):
                 code = 'FQ-' + token()
                 try:
-                    db.execute('INSERT INTO spools (code, profile, printer, material, brand, notes, created, color) '
-                               'VALUES (?,?,?,?,?,?,?,?)',
-                               (code, profile, printer, material, brand, notes, utc_now(), color))
+                    db.execute('INSERT INTO spools (code, profile, printer, material, brand, notes, created, color, price) '
+                               'VALUES (?,?,?,?,?,?,?,?,?)',
+                               (code, profile, printer, material, brand, notes, utc_now(), color, price))
                 except sqlite3.IntegrityError:
                     continue
                 return dict(db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone())
@@ -521,6 +544,46 @@ def read_workspace(host, caps):
                           profiles=profiles,
                           dirty=bool(edited.is_dirty) if edited else False,
                           colours=slot_colours(bundle))
+
+
+def first_config_value(raw):
+    """First element of an OrcaSlicer serialized option: 'a;b', '"quoted \\"x\\"";b' or '1.5,2'."""
+    text = str(raw or '')
+    if text.startswith('"'):
+        out, i = [], 1
+        while i < len(text) and text[i] != '"':
+            if text[i] == '\\' and i + 1 < len(text):
+                i += 1
+            out.append(text[i])
+            i += 1
+        return ''.join(out)
+    return text.split(';', 1)[0].strip()
+
+
+def profile_defaults(host, profile):
+    """Material, vendor, colour and price per kg of a filament profile; GUI thread only."""
+    defaults = {'material': '', 'brand': '', 'color': '', 'price': 0.0}
+    try:
+        find = getattr(host.preset_bundle().filaments, 'find_preset', None)
+        preset = find(profile) if callable(find) else None
+    except Exception:
+        preset = None
+    if preset is None:
+        return defaults
+    value = lambda key: first_config_value(preset.config_value(key))  # noqa: E731
+    defaults['material'] = value('filament_type')[:40]
+    defaults['brand'] = value('filament_vendor')[:80]
+    for key in ('default_filament_colour', 'filament_colour'):
+        try:
+            colour = normalize_colour(value(key))
+        except ValueError:
+            colour = ''
+        if colour:
+            defaults['color'] = colour
+            break
+    with contextlib.suppress(ValueError):
+        defaults['price'] = normalize_price(value('filament_cost').split(',', 1)[0])
+    return defaults
 
 
 CANCELLED_TEXT = 'Отменено в OrcaSlicer — можно повторить'
@@ -1052,6 +1115,9 @@ class Controller:
             if self.process_queue():
                 ws = None
             return [{'type': 'state', 'state': self.state(ws)}]
+        if kind == 'profile_info':
+            profile = str(data.get('profile', ''))
+            return [dict({'type': 'profile_info', 'profile': profile}, **profile_defaults(self.host, profile))]
         if not self.available:
             return [{'type': 'error', 'message': 'Хранилище плагина недоступно: нужен OrcaSlicer 2.5.0 или новее'}]
         out = []
@@ -1061,7 +1127,8 @@ class Controller:
             if profile not in ws.profiles:
                 raise ValueError('Профиль недоступен для текущего принтера')
             spool = self.store.add_spool(profile, ws.printer, data.get('material', ''), data.get('brand', ''),
-                                         data.get('notes', ''), color=data.get('color', ''))
+                                         data.get('notes', ''), color=data.get('color', ''),
+                                         price=data.get('price', ''))
             out += [{'type': 'created', 'spool': spool}, self.label(spool['code'])]
         elif kind == 'delete':
             self.store.delete_spool(data.get('code', ''))
@@ -1141,7 +1208,7 @@ async function load(){let d;try{d=await call('/api/status')}catch(e){if(e.status
  for(const p of d.recent){const r=document.createElement('div');r.className='row';r.append(text('span','✓ '+p.profile+' → слот '+(p.slot+1)));$('queue').append(r)}
  if(!d.pending.length&&!d.recent.length)$('queue').append(text('p','Пусто'));
  $('spools').replaceChildren();for(const s of d.spools){const r=document.createElement('div');r.className='row';const a=text('a','Этикетка');a.href='/label/'+encodeURIComponent(s.code);a.target='_blank';
-  const h=text('b','');h.append(swatch(s.color),s.code+' · '+s.material+(s.brand?' · '+s.brand:''));r.append(h,text('div',s.profile),a);$('spools').append(r)}}
+  const h=text('b','');h.append(swatch(s.color),s.code+' · '+s.material+(s.brand?' · '+s.brand:'')+(s.price?' · '+s.price+' за кг':''));r.append(h,text('div',s.profile),a);$('spools').append(r)}}
 load();setInterval(()=>{if(!$('app').hidden)load()},3000);
 </script></html>'''
 
@@ -1157,9 +1224,11 @@ option{color:#000}button{background:var(--orca-accent,#4a89e8);color:var(--orca-
 </style><h1>🧵 Filament QR</h1><div id="banner"></div>
 <div class="grid"><section><h2>Новая катушка</h2>
 <label>Профиль филамента</label><select id="profile"></select>
+<p class="muted">Материал, производитель, цвет и цена подставляются из профиля — их можно изменить.</p>
 <label>Материал</label><input id="material" maxlength="40" placeholder="PLA / PETG / ABS">
 <label>Производитель</label><input id="brand" maxlength="80" placeholder="eSUN">
 <label>Цвет катушки</label><input id="color" type="color" value="#ffffff" style="width:80px;height:36px;padding:2px">
+<label>Цена за кг</label><input id="price" inputmode="decimal" maxlength="12" placeholder="например, 1500">
 <label>Заметка</label><input id="notes" maxlength="300">
 <button id="add">Создать катушку и этикетку</button><p id="status"></p><div id="label"></div></section>
 <section><h2>Телефон</h2><div id="phone"></div>
@@ -1176,7 +1245,9 @@ function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefine
 function btn(text,fn,cls){const b=el('button',text,cls);b.onclick=fn;return b}
 function swatch(c){const e=el('span',undefined,'sw');if(c){e.style.background=c;e.title=c}else{e.style.visibility='hidden'}return e}
 function slotSelect(){const s=el('select');(S.slots&&S.slots.length?S.slots:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
-$('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,color:$('color').value,notes:$('notes').value});
+$('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,color:$('color').value,price:$('price').value,notes:$('notes').value});
+let infoFor='';function askProfile(){const p=$('profile').value;if(p&&p!==infoFor){infoFor=p;post('profile_info',{profile:p})}}
+$('profile').onchange=askProfile;
 $('applyLan').onclick=()=>post('set_lan',{enabled:$('lan').checked,port:parseInt($('port').value,10)});
 $('rotate').onclick=()=>post('rotate_pin');$('revoke').onclick=()=>post('revoke_sessions');
 const STATUS={queued:'в очереди',manual:'выберите вручную',needs_attention:'нужно внимание',cancelled:'отменено'};
@@ -1187,7 +1258,7 @@ function render(s){S=s;
  if(s.decoder_error)b.append(el('p','Распознавание фото недоступно: '+s.decoder_error+'. Коды с этикеток можно вводить вручную.','err'));
  if(s.mode==='automatic'&&!s.colour_api)b.append(el('p','Эта версия OrcaSlicer не даёт плагинам менять цвет слота: после выбора задайте цвет катушки в слоте вручную.','muted'));
  b.append(el('p','Принтер: '+(s.printer||'—')+'   ·   Слоты: '+((s.slots||[]).map((n,i)=>(i+1)+': '+n).join('; ')||'—'),'muted'));
- const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;
+ const old=$('profile').value;$('profile').replaceChildren();for(const n of s.profiles||[]){const o=el('option',n);o.value=n;$('profile').append(o)}if((s.profiles||[]).includes(old))$('profile').value=old;askProfile();
  if(!s.available)return;
  const ph=$('phone');ph.replaceChildren();
  if(s.server_error)ph.append(el('p',s.server_error,'err'));
@@ -1203,12 +1274,13 @@ function render(s){S=s;
  for(const p of s.recent){q.append(el('div','✓ '+p.profile+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
  if(!s.pending.length&&!s.recent.length)q.append(el('p','Пусто','muted'));
  const sp=$('spools');sp.replaceChildren();
- for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:''));t.append(h);t.append(el('div',item.profile,'muted'));
+ for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:'')+(item.price?' · '+item.price+' за кг':''));t.append(h);if(item.notes)t.append(el('div',item.notes,'muted'));t.append(el('div',item.profile,'muted'));
   const sel=slotSelect();r.append(t,sel,btn('Выбрать',()=>post('use',{code:item.code,slot:parseInt(sel.value,10)})),btn('Этикетка',()=>post('label',{code:item.code}),'secondary'),
   btn('Удалить',()=>{if(confirm('Удалить катушку '+item.code+'?'))post('delete',{code:item.code})},'secondary'));sp.append(r)}
  if(!s.spools.length)sp.append(el('p','Катушек пока нет','muted'))}
 orca.onMessage(d=>{if(d.type==='state')render(d.state);
  else if(d.type==='label'){$('label').innerHTML=d.svg;const u=(S.urls&&S.urls.length)?'http://127.0.0.1:'+S.port+'/label/'+d.code:'';$('status').textContent=u?'Печать этикетки: откройте '+u+' в браузере':'';$('status').className='muted'}
+ else if(d.type==='profile_info'){if(d.profile!==$('profile').value)return;$('material').value=d.material;$('brand').value=d.brand;if(d.color)$('color').value=d.color.toLowerCase();$('price').value=d.price?String(d.price):''}
  else if(d.type==='created'){$('status').textContent='Создана катушка '+d.spool.code;$('status').className='ok'}
  else if(d.type==='error'){$('status').textContent='Ошибка: '+d.message;$('status').className='err'}});
 post('tick');setInterval(()=>post('tick'),1500);

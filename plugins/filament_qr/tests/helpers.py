@@ -30,8 +30,12 @@ class TempDirTest(unittest.TestCase):
 
 
 class _Preset:
-    def __init__(self, name, compatible=True):
+    def __init__(self, name, compatible=True, config=None):
         self.name, self.is_visible, self.is_compatible, self.is_dirty = name, True, compatible, False
+        self.config = config or {}
+
+    def config_value(self, key):
+        return self.config.get(key)
 
 
 class _Filaments:
@@ -46,6 +50,9 @@ class _Filaments:
 
     def edited_preset(self):
         return self.items[0]
+
+    def find_preset(self, name):
+        return next((p for p in self.items if p.name == name), None)
 
 
 def _bundle(state, profiles):
@@ -66,6 +73,7 @@ class UpstreamHost:
         self.ui_thread = threading.current_thread()
         self.state = {'slots': list(slots), 'colours': ['#FFFFFF'] * len(slots)}
         self.profiles = dict(profiles)
+        self.profile_configs = {}
         self.answer = 'yes'
         self.dialogs, self.begins, self.commits, self.violations = [], [], [], []
         self.on_begin = self.begin_error = self.commit_error = self.target_override = None
@@ -87,7 +95,10 @@ class UpstreamHost:
         return self.state['slots']
 
     def preset_bundle(self):
-        return _bundle(self.state, self.profiles)
+        bundle = _bundle(self.state, self.profiles)
+        for preset in bundle.filaments.items:
+            preset.config = self.profile_configs.get(preset.name, {})
+        return bundle
 
     def off_ui(self, call):
         if threading.current_thread() is self.ui_thread:

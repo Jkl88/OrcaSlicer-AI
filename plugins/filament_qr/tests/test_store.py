@@ -45,7 +45,8 @@ class StoreSchemaTest(TempDirTest):
         db.close()
 
         store = fq.Store(path)
-        self.assertEqual(store.schema_version(), 2)
+        self.assertEqual(store.schema_version(), fq.SCHEMA_VERSION)
+        self.assertEqual(store.get_spool('FQ-ABCDEF')['price'], 0)
         self.assertEqual(store.get_spool('FQ-ABCDEF')['color'], '')
         self.assertEqual(store.list_pending()[0]['color'], '')
 
@@ -81,6 +82,13 @@ class StoreSpoolTest(TempDirTest):
         for bad in ('red', '#12345', '#GGGGGG', '#1234567', '"><script>'):
             with self.subTest(colour=bad), self.assertRaises(ValueError):
                 self.store.add_spool('Generic PLA', 'P', 'PLA', color=bad)
+
+    def test_price_per_kg_is_stored_and_validated(self):
+        self.assertEqual(self.store.add_spool('Generic PLA', 'P', 'PLA', price='1 250,5')['price'], 1250.5)
+        self.assertEqual(self.store.add_spool('Generic PLA', 'P', 'PLA')['price'], 0)
+        for bad in ('-1', 'abc', '1e9', 'nan', 'inf'):
+            with self.subTest(price=bad), self.assertRaises(ValueError):
+                self.store.add_spool('Generic PLA', 'P', 'PLA', price=bad)
 
     def test_scan_captures_spool_colour(self):
         spool = self.store.add_spool('Generic PLA', 'P', 'PLA', color='#FF0000')

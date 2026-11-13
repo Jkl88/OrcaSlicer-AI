@@ -61,6 +61,18 @@ class ControllerTest(TempDirTest):
             self.assertIn('viewBox', item['svg'])
         self.assertIs(controller.url_qrs(state['urls']), controller.url_qrs(list(state['urls'])))
 
+    def test_profile_info_and_price_on_create(self):
+        controller, host = self.make()
+        host.profile_configs['Generic PETG'] = {'filament_type': 'PETG', 'filament_vendor': 'eSUN',
+                                                'default_filament_colour': '#112233', 'filament_cost': '20'}
+        [info] = controller.handle({'type': 'profile_info', 'profile': 'Generic PETG'})
+        self.assertEqual(info, {'type': 'profile_info', 'profile': 'Generic PETG', 'material': 'PETG',
+                                'brand': 'eSUN', 'color': '#112233', 'price': 20.0})
+        [created, _label, _state] = controller.handle(
+            {'type': 'create', 'profile': 'Generic PETG', 'material': 'PETG+', 'brand': 'eSUN', 'color': '#112233',
+             'price': '1500'})
+        self.assertEqual((created['spool']['material'], created['spool']['price']), ('PETG+', 1500.0))
+
     def test_state_reports_decoder_problem(self):
         controller, _ = self.make()
         self.assertIn('decoder_error', controller.handle({'type': 'tick'})[-1]['state'])

@@ -61,6 +61,30 @@ class WorkspaceTest(TempDirTest):
         self.assertEqual(fq.read_workspace(legacy_host(), None).colours, [])
 
 
+class ProfileDefaultsTest(TempDirTest):
+    def test_values_come_from_the_filament_profile(self):
+        host = automatic_host(self.tmp)
+        host.profile_configs['Generic PETG'] = {
+            'filament_type': 'PETG', 'filament_vendor': '"Bambu Lab"', 'default_filament_colour': '#ff8800',
+            'filament_colour': '#000000', 'filament_cost': '24.5'}
+        self.assertEqual(fq.profile_defaults(host, 'Generic PETG'),
+                         {'material': 'PETG', 'brand': 'Bambu Lab', 'color': '#FF8800', 'price': 24.5})
+
+    def test_colour_falls_back_and_bad_values_are_dropped(self):
+        host = automatic_host(self.tmp)
+        host.profile_configs['Generic PLA'] = {
+            'filament_type': 'PLA;PETG', 'filament_vendor': '"Q\\"uote";Other', 'default_filament_colour': '""',
+            'filament_colour': '#00aa00;#ffffff', 'filament_cost': 'abc'}
+        self.assertEqual(fq.profile_defaults(host, 'Generic PLA'),
+                         {'material': 'PLA', 'brand': 'Q"uote', 'color': '#00AA00', 'price': 0.0})
+
+    def test_unknown_profile_gives_empty_defaults(self):
+        self.assertEqual(fq.profile_defaults(automatic_host(self.tmp), 'Missing'),
+                         {'material': '', 'brand': '', 'color': '', 'price': 0.0})
+        self.assertEqual(fq.profile_defaults(legacy_host(), 'Generic PLA'),
+                         {'material': '', 'brand': '', 'color': '', 'price': 0.0})
+
+
 class PrepareTest(TempDirTest):
     def setUp(self):
         super().setUp()
