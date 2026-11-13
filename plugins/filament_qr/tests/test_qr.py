@@ -132,6 +132,13 @@ class PageTest(unittest.TestCase):
         self.assertIn('s.decoder_error', fq.PLUGIN_HTML)
         self.assertIn('swatch(', fq.PLUGIN_HTML)
 
+    def test_plugin_page_offers_to_delete_labels_without_profile(self):
+        page = fq.PLUGIN_HTML
+        self.assertIn("d.type==='profile_missing'", page)
+        self.assertIn('item.missing', page)
+        self.assertIn('p.missing', page)
+        self.assertIn('и её профиль', page)
+
     def test_plugin_page_shows_address_qr_codes(self):
         self.assertIn('s.url_qrs', fq.PLUGIN_HTML)
 

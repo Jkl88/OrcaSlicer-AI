@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from pathlib import Path
 import unittest
 import threading
 import time
@@ -223,7 +224,7 @@ class LifecycleTest(TempDirTest):
         page.on_load()
         self.addCleanup(page.on_unload)
         self.assertTrue(page.controller.available)
-        self.assertTrue((self.tmp / 'storage' / 'filament_qr.sqlite3').exists())
+        self.assertTrue((Path(host.plugin.storage()) / 'filament_qr.sqlite3').exists())
 
     def test_registration_without_permission_api(self):
         module, fake = self.load_with_fake_orca(automatic_host(self.tmp))

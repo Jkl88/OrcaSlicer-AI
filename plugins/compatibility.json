@@ -5,8 +5,9 @@
     "tag": "v2.5.0",
     "commit": "40ecc66f78ed72dc368e0c1ebe40d77f00cc8a19",
     "required_api": [
-      "orca.host.preset",
       "orca.host.plugin.storage",
+      "orca.host.preset",
+      "orca.host.preset.bundles",
       "orca.host.ui.message",
       "orca.request_permissions"
     ]
@@ -27,9 +28,9 @@
     {
       "id": "filament_qr",
       "file": "plugins/filament_qr/orca_filament_qr.py",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "min_host": "2.5.0",
-      "sha256": "f5793d4923754c6f447af9a0dcde416ab6b19bbd5264c7ac81e9a8d878335aed",
+      "sha256": "ad3c8f3bce488ddc7409fc17ef836ecbb82d281801dc7131ad26b115247a94ac",
       "platforms": {
         "windows-x64": "not-tested",
         "linux-x64": "not-tested",

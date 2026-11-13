@@ -13,7 +13,7 @@
 # name = "Filament QR"
 # description = "QR-этикетки для катушек и выбор филамента сканированием с телефона"
 # author = "OrcaSlicer-AI"
-# version = "1.4.0"
+# version = "1.5.0"
 # ///
 """Filament QR: per-spool QR labels and phone scanning for OrcaSlicer.
 
@@ -38,6 +38,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import socket
 import socketserver
 import sqlite3
@@ -259,7 +260,17 @@ class Store:
             row = db.execute('SELECT * FROM spools WHERE code=?', (code,)).fetchone()
             return dict(row) if row else None
 
-    def add_spool(self, profile, printer, material, brand='', notes='', token=None, color='', price=''):
+    def new_code(self, token=None):
+        """A spool code that no spool uses yet."""
+        token = token or (lambda: secrets.token_hex(3).upper())
+        with self._db() as db:
+            for _ in range(20):
+                code = 'FQ-' + token()
+                if db.execute('SELECT 1 FROM spools WHERE code=?', (code,)).fetchone() is None:
+                    return code
+        raise RuntimeError('Не удалось создать уникальный код')
+
+    def add_spool(self, profile, printer, material, brand='', notes='', token=None, color='', price='', code=None):
         profile, printer = str(profile).strip(), str(printer).strip()
         color, price = normalize_colour(color), normalize_price(price)
         material, brand, notes = str(material).strip() or 'FILAMENT', str(brand).strip(), str(notes).strip()
@@ -268,9 +279,10 @@ class Store:
         if len(profile) > 180 or len(printer) > 180 or len(material) > 40 or len(brand) > 80 or len(notes) > 300:
             raise ValueError('Слишком длинное значение')
         token = token or (lambda: secrets.token_hex(3).upper())
+        fixed = normalize_code(code) if code else None
         with self._db() as db:
-            for _ in range(20):
-                code = 'FQ-' + token()
+            for _ in range(1 if fixed else 20):
+                code = fixed or 'FQ-' + token()
                 try:
                     db.execute('INSERT INTO spools (code, profile, printer, material, brand, notes, created, color, price) '
                                'VALUES (?,?,?,?,?,?,?,?,?)',
@@ -515,6 +527,7 @@ class WorkspaceState:
     profiles: list = field(default_factory=list)   # compatible, visible filament presets
     dirty: bool = False
     colours: list = field(default_factory=list)    # #RRGGBB per zero-based slot, [] when unknown
+    all_profiles: list = field(default_factory=list)  # every filament preset name, [] when unknown
 
 
 def slot_colours(bundle):
@@ -543,7 +556,9 @@ def read_workspace(host, caps):
                           slots=list(bundle.current_filament_preset_names()),
                           profiles=profiles,
                           dirty=bool(edited.is_dirty) if edited else False,
-                          colours=slot_colours(bundle))
+                          colours=slot_colours(bundle),
+                          all_profiles=list(filaments.preset_names()) if callable(
+                              getattr(filaments, 'preset_names', None)) else [])
 
 
 def first_config_value(raw):
@@ -586,6 +601,141 @@ def profile_defaults(host, profile):
     return defaults
 
 
+BUNDLE_ID = 'FilamentQR'
+BUNDLE_PREFIX = f'_local/{BUNDLE_ID}/'
+_CODE_PREFIX_RE = re.compile(r'^(?:FQ-[0-9A-F]{6}\s+)+')
+_UNSAFE_NAME_RE = re.compile(r'[\\/:*?"<>|]')
+
+
+def bare_profile_name(name):
+    """Profile name without a bundle folder and without spool-code prefixes, safe as a file name."""
+    name = str(name).strip()
+    if name.startswith(('_local/', '_subscribed/')) and name.count('/') >= 2:
+        name = name.split('/', 2)[2]
+    name = _UNSAFE_NAME_RE.sub('-', _CODE_PREFIX_RE.sub('', name))
+    return ' '.join(name.split())
+
+
+def spool_profile_name(code, base):
+    return f'{BUNDLE_PREFIX}{normalize_code(code)} {bare_profile_name(base)}'
+
+
+def _data_root(storage_dir):
+    """OrcaSlicer's data folder: the parent of orca_plugins, which holds the plugin storage."""
+    parts = Path(storage_dir).parts if storage_dir else ()
+    return Path(*parts[:parts.index('orca_plugins')]) if 'orca_plugins' in parts else None
+
+
+def _write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.' + path.name + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(value, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+class SpoolProfiles:
+    """Per-spool filament profiles in OrcaSlicer's local preset bundle FilamentQR. GUI thread only."""
+
+    def __init__(self, host, storage_dir):
+        self.host = host
+        self.data_root = _data_root(storage_dir)
+        bundles = getattr(getattr(host, 'preset', None), 'bundles', None)
+        self._reload = getattr(bundles, 'reload_local', None)
+        self._list_ids = getattr(bundles, 'list_ids', None)
+        self.available = self.data_root is not None and callable(self._reload) and callable(self._list_ids)
+        self._folder = None
+
+    @staticmethod
+    def owns(name):
+        return str(name).startswith(BUNDLE_PREFIX)
+
+    def _folder_hints(self):
+        bundle = self.host.preset_bundle()
+        for collection in (getattr(bundle, name, None) for name in ('filaments', 'printers', 'prints')):
+            for index in range(collection.size() if callable(getattr(collection, 'size', None)) else 0):
+                parts = Path(str(getattr(collection.preset(index), 'file', '') or '')).parts
+                if 'user' in parts[:-1]:
+                    yield parts[parts.index('user') + 1]
+
+    def _bundle_dir(self):
+        if self._folder is None:
+            users = self.data_root / 'user'
+            existing = sorted(d.name for d in users.iterdir() if d.is_dir()) if users.is_dir() else []
+            for folder in dict.fromkeys([*self._folder_hints(), *existing, 'default']):
+                bundle_dir = users / folder / '_local' / BUNDLE_ID
+                created = not bundle_dir.exists()
+                _write_json(bundle_dir / 'bundle_metadata.json',
+                            {'id': BUNDLE_ID, 'name': 'Filament QR', 'version': '1.0.0'})
+                if BUNDLE_ID in self._list_ids():
+                    self._folder = folder
+                    break
+                if created:
+                    shutil.rmtree(bundle_dir, ignore_errors=True)
+                    with contextlib.suppress(OSError):
+                        bundle_dir.parent.rmdir()
+            else:
+                raise RuntimeError('OrcaSlicer не видит папку локальных профилей')
+        return self.data_root / 'user' / self._folder / '_local' / BUNDLE_ID
+
+    def _file(self, name):
+        return self._bundle_dir() / 'filament' / (name[len(BUNDLE_PREFIX):] + '.json')
+
+    def _root_parent(self, base):
+        if not self.owns(base):
+            return base
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            return json.loads(self._file(base).read_text(encoding='utf-8'))['inherits']
+        preset = self.host.preset_bundle().filaments.find_preset(base)
+        parent = first_config_value(preset.config_value('inherits')) if preset is not None else ''
+        if not parent:
+            raise RuntimeError(f'не найден исходный профиль для «{base}»')
+        return parent
+
+    def create(self, code, base, brand='', color='', price=0.0):
+        """Write and load the spool's profile, derived from base; returns its OrcaSlicer name."""
+        name = spool_profile_name(code, base)
+        bare = name[len(BUNDLE_PREFIX):]
+        data = {'type': 'filament', 'name': bare, 'from': 'User', 'instantiation': 'true', 'version': '1.0.0',
+                'inherits': self._root_parent(base), 'filament_settings_id': [bare]}
+        if brand:
+            data['filament_vendor'] = [brand]
+        if color:
+            data['default_filament_colour'] = [color]
+        if price:
+            data['filament_cost'] = [f'{price:.2f}'.rstrip('0').rstrip('.')]
+        path = self._file(name)
+        _write_json(path, data)
+        try:
+            self._reload(BUNDLE_ID)
+        except Exception:
+            path.unlink(missing_ok=True)
+            with contextlib.suppress(Exception):
+                self._reload(BUNDLE_ID)
+            raise
+        return name
+
+    def remove(self, name):
+        """Delete the spool's own profile; OrcaSlicer may refuse, and then the file is restored."""
+        if not self.owns(name):
+            return
+        path = self._file(name)
+        if not path.exists():
+            return
+        content = path.read_bytes()
+        path.unlink()
+        try:
+            self._reload(BUNDLE_ID)
+        except Exception:
+            path.write_bytes(content)
+            raise
+
+
 CANCELLED_TEXT = 'Отменено в OrcaSlicer — можно повторить'
 
 
@@ -601,6 +751,9 @@ def prepare_pending(host, store, pending, caps):
 
     if slot >= len(ws.slots):
         store.mark(pid, 'needs_attention', f'У принтера нет слота {slot + 1}')
+        return 'needs_attention'
+    if ws.all_profiles and profile not in ws.all_profiles:
+        store.mark(pid, 'needs_attention', f'Профиль «{profile}» не найден — удалите этикетку {pending["code"]}')
         return 'needs_attention'
     colour = pending.get('color', '')
     current_colour = ws.colours[slot] if slot < len(ws.colours) else ''
@@ -992,6 +1145,7 @@ class Controller:
             self.settings = Settings(self.data_dir / 'settings.json')
             self.service = Service(self.store)
             self.server = FilamentHttpServer(self.service)
+        self.profiles = SpoolProfiles(host, data_dir)
 
     @property
     def available(self):
@@ -1091,9 +1245,11 @@ class Controller:
         address = self.server.address
         port = address[1] if address else self.settings.port
         urls = [f'http://{h}:{port}/' for h in self.hosts] if address else []
+        known = set(ws.all_profiles)
+        spools = [dict(s, missing=bool(known) and s['profile'] not in known) for s in self.store.list_spools()]
         base.update({
-            'spools': self.store.list_spools(),
-            'pending': self.store.list_pending(),
+            'spools': spools,
+            'pending': [dict(p, missing=bool(known) and p['profile'] not in known) for p in self.store.list_pending()],
             'recent': self.store.recent_done(),
             'lan_enabled': self.settings.lan_enabled,
             'port': port,
@@ -1126,15 +1282,37 @@ class Controller:
             profile = str(data.get('profile', ''))
             if profile not in ws.profiles:
                 raise ValueError('Профиль недоступен для текущего принтера')
-            spool = self.store.add_spool(profile, ws.printer, data.get('material', ''), data.get('brand', ''),
-                                         data.get('notes', ''), color=data.get('color', ''),
-                                         price=data.get('price', ''))
+            brand, color, price = str(data.get('brand', '')).strip(), normalize_colour(data.get('color', '')), \
+                normalize_price(data.get('price', ''))
+            code, own = self.store.new_code(), profile
+            if self.profiles.available:
+                try:
+                    own = self.profiles.create(code, profile, brand, color, price)
+                except Exception as exc:
+                    return [{'type': 'error', 'message': f'Не удалось создать профиль катушки: {exc}'}]
+            try:
+                spool = self.store.add_spool(own, ws.printer, data.get('material', ''), brand, data.get('notes', ''),
+                                             color=color, price=price, code=code)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self.profiles.remove(own)
+                raise
             out += [{'type': 'created', 'spool': spool}, self.label(spool['code'])]
         elif kind == 'delete':
+            spool = self.store.get_spool(data.get('code', ''))
+            if spool is not None and self.profiles.available:
+                try:
+                    self.profiles.remove(spool['profile'])
+                except Exception as exc:
+                    return [{'type': 'error', 'message': f'Профиль катушки не удалён, этикетка оставлена: {exc}'}]
             self.store.delete_spool(data.get('code', ''))
         elif kind == 'label':
             out.append(self.label(data.get('code', '')))
         elif kind == 'use':
+            spool = self.store.get_spool(data.get('code', ''))
+            known = self.refresh_workspace().all_profiles
+            if spool is not None and known and spool['profile'] not in known:
+                return [{'type': 'profile_missing', 'code': spool['code'], 'profile': spool['profile']}]
             self.service.scan(data.get('code', ''), data.get('slot', 0))
             self.process_queue()
         elif kind == 'retry':
@@ -1244,6 +1422,7 @@ function post(type,data){orca.postMessage(Object.assign({type},data||{}))}
 function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
 function btn(text,fn,cls){const b=el('button',text,cls);b.onclick=fn;return b}
 function swatch(c){const e=el('span',undefined,'sw');if(c){e.style.background=c;e.title=c}else{e.style.visibility='hidden'}return e}
+function askDelete(code,after){if(confirm('Удалить этикетку '+code+' и её профиль в OrcaSlicer?')){post('delete',{code});if(after)after()}}
 function slotSelect(){const s=el('select');(S.slots&&S.slots.length?S.slots:['']).forEach((n,i)=>{const o=el('option','Слот '+(i+1)+(n?' — '+n:''));o.value=i;s.append(o)});s.style.width='auto';return s}
 $('add').onclick=()=>post('create',{profile:$('profile').value,material:$('material').value,brand:$('brand').value,color:$('color').value,price:$('price').value,notes:$('notes').value});
 let infoFor='';function askProfile(){const p=$('profile').value;if(p&&p!==infoFor){infoFor=p;post('profile_info',{profile:p})}}
@@ -1270,16 +1449,18 @@ function render(s){S=s;
  if(document.activeElement!==$('port'))$('port').value=s.port;if(document.activeElement!==$('lan'))$('lan').checked=s.lan_enabled;
  const q=$('queue');q.replaceChildren();
  for(const p of s.pending){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(p.color),p.code+' → слот '+(p.slot+1)+': '+p.profile);t.append(h);t.append(el('div',(STATUS[p.status]||p.status)+(p.message?' — '+p.message:''),p.status==='needs_attention'?'err':'warn'));
-  r.append(t,btn('Повторить',()=>post('retry',{id:p.id})),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));q.append(r)}
+  if(p.missing)r.append(t,btn('Удалить этикетку',()=>askDelete(p.code,()=>post('dismiss',{id:p.id}))),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));
+  else r.append(t,btn('Повторить',()=>post('retry',{id:p.id})),btn('Убрать',()=>post('dismiss',{id:p.id}),'secondary'));q.append(r)}
  for(const p of s.recent){q.append(el('div','✓ '+p.profile+' → слот '+(p.slot+1)+' ('+p.updated+')','row ok'))}
  if(!s.pending.length&&!s.recent.length)q.append(el('p','Пусто','muted'));
  const sp=$('spools');sp.replaceChildren();
- for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:'')+(item.price?' · '+item.price+' за кг':''));t.append(h);if(item.notes)t.append(el('div',item.notes,'muted'));t.append(el('div',item.profile,'muted'));
+ for(const item of s.spools){const r=el('div',undefined,'row');const t=el('div',undefined,'grow');const h=el('b');h.append(swatch(item.color),item.code+' · '+item.material+(item.brand?' · '+item.brand:'')+(item.color?' · '+item.color:'')+(item.price?' · '+item.price+' за кг':''));t.append(h);if(item.notes)t.append(el('div',item.notes,'muted'));if(item.missing)t.append(el('div','Профиль не найден: '+item.profile,'err'));t.append(el('div',item.profile,'muted'));
   const sel=slotSelect();r.append(t,sel,btn('Выбрать',()=>post('use',{code:item.code,slot:parseInt(sel.value,10)})),btn('Этикетка',()=>post('label',{code:item.code}),'secondary'),
-  btn('Удалить',()=>{if(confirm('Удалить катушку '+item.code+'?'))post('delete',{code:item.code})},'secondary'));sp.append(r)}
+  btn('Удалить',()=>askDelete(item.code),'secondary'));sp.append(r)}
  if(!s.spools.length)sp.append(el('p','Катушек пока нет','muted'))}
 orca.onMessage(d=>{if(d.type==='state')render(d.state);
  else if(d.type==='label'){$('label').innerHTML=d.svg;const u=(S.urls&&S.urls.length)?'http://127.0.0.1:'+S.port+'/label/'+d.code:'';$('status').textContent=u?'Печать этикетки: откройте '+u+' в браузере':'';$('status').className='muted'}
+ else if(d.type==='profile_missing'){if(confirm('Профиль «'+d.profile+'» не найден в OrcaSlicer. Удалить этикетку '+d.code+'?'))post('delete',{code:d.code})}
  else if(d.type==='profile_info'){if(d.profile!==$('profile').value)return;$('material').value=d.material;$('brand').value=d.brand;if(d.color)$('color').value=d.color.toLowerCase();$('price').value=d.price?String(d.price):''}
  else if(d.type==='created'){$('status').textContent='Создана катушка '+d.spool.code;$('status').className='ok'}
  else if(d.type==='error'){$('status').textContent='Ошибка: '+d.message;$('status').className='err'}});
